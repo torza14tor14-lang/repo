@@ -30,132 +30,22 @@ mysqli_query($conn, "CREATE TABLE IF NOT EXISTS product_costs (
 $status = '';
 $message = '';
 
-if (isset($_POST['start_production'])) {
-    $order_id = (int)$_POST['order_id'];
-    $amount = (float)$_POST['amount'];
-    $user = $_SESSION['fullname'];
-
-    $q_order = mysqli_query($conn, "SELECT order_no, formula_name FROM production_orders WHERE id = $order_id");
-    if(mysqli_num_rows($q_order) > 0) {
-        $order_data = mysqli_fetch_assoc($q_order);
-        $formula_name = mysqli_real_escape_string($conn, $order_data['formula_name']);
-        $order_no = $order_data['order_no'];
-
-        $q_prod = mysqli_query($conn, "SELECT id, shelf_life_days FROM products WHERE p_name = '$formula_name' LIMIT 1");
-        
-        if (mysqli_num_rows($q_prod) > 0) {
-            $prod_data = mysqli_fetch_assoc($q_prod);
-            $p_id = $prod_data['id'];
-            $shelf_life = (int)$prod_data['shelf_life_days'];
-
-            $formulas = mysqli_query($conn, "SELECT f.ingredient_id, f.quantity_required, p.p_name, p.p_qty, p.p_code 
-                                             FROM formulas f 
-                                             JOIN products p ON f.ingredient_id = p.id 
-                                             WHERE f.product_id = '$p_id'");
-            
-            $can_produce = true;
-            $items_to_deduct = [];
-            $total_production_cost = 0; // 🚀 ตัวแปรเก็บต้นทุนรวม
-            
-            $missing_msg = "<ul style='text-align: left; padding-left: 20px; margin-top: 10px; color: #475569; font-size: 15px;'>";
-
-            while ($f = mysqli_fetch_assoc($formulas)) {
-                $need = $f['quantity_required'] * $amount;
-                
-                if ($f['p_qty'] < $need) {
-                    $can_produce = false;
-                    $missing = $need - $f['p_qty'];
-                    $missing_msg .= "<li style='margin-bottom: 8px;'><b>{$f['p_name']}</b> <br>ขาดอีก <span style='color: #ef4444; font-weight: bold;'>" . number_format($missing, 3) . "</span> กก.</li>";
-                } else {
-                    // 🚀 ค้นหาราคาวัตถุดิบล่าสุด (Last Purchase Price) จากการสั่งซื้อที่เคยรับเข้า
-                    $ing_id = $f['ingredient_id'];
-                    $q_price = mysqli_query($conn, "SELECT unit_price FROM po_items 
-                                                    JOIN purchase_orders po ON po_items.po_id = po.po_id 
-                                                    WHERE item_id = '$ing_id' AND po.status IN ('Delivered', 'Completed') 
-                                                    ORDER BY po.created_at DESC LIMIT 1");
-                    
-                    if ($q_price && mysqli_num_rows($q_price) > 0) {
-                        $unit_price = (float)mysqli_fetch_assoc($q_price)['unit_price'];
-                    } else {
-                        $unit_price = 0; // ถ้าไม่เคยสั่งซื้อเลย ให้เป็น 0 ไปก่อน (อาจจะต้องปรับให้ดึงราคามาตรฐานจากตาราง Products แทนในอนาคต)
-                    }
-                    
-                    $item_cost = $need * $unit_price;
-                    $total_production_cost += $item_cost;
-
-                    $items_to_deduct[] = [
-                        'id' => $ing_id, 
-                        'qty' => $need, 
-                        'code' => $f['p_code']
-                    ];
-                }
-            }
-            $missing_msg .= "</ul>";
-
-            if ($can_produce && count($items_to_deduct) > 0) {
-                // 1. หักสต็อกวัตถุดิบ
-                foreach ($items_to_deduct as $item) {
-                    mysqli_query($conn, "UPDATE products SET p_qty = p_qty - {$item['qty']} WHERE id = {$item['id']}");
-                    mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, reference, action_by) 
-                                         VALUES ('{$item['id']}', 'OUT', '{$item['qty']}', 'ผลิตสินค้า FG-#$p_id', '$user')");
-                }
-                
-                // 2. 🚀 สร้าง LOT เข้าสถานะกักกันตรวจสอบ (Pending_QA)
-                $lot_no = "LOT-" . date('Ymd') . "-" . str_pad($order_id, 4, "0", STR_PAD_LEFT);
-                $mfg_date = date('Y-m-d'); 
-                $exp_date = ($shelf_life > 0) ? date('Y-m-d', strtotime($mfg_date. " + {$shelf_life} days")) : '2099-12-31'; 
-
-                mysqli_query($conn, "INSERT INTO inventory_lots (product_id, lot_no, mfg_date, exp_date, qty, status) 
-                                     VALUES ('$p_id', '$lot_no', '$mfg_date', '$exp_date', '$amount', 'Pending_QA')");
-
-                mysqli_query($conn, "UPDATE production_orders SET status = 'Completed' WHERE id = $order_id");
-
-                // 3. บันทึกต้นทุนลงตาราง product_costs
-                $cost_per_unit = ($amount > 0) ? ($total_production_cost / $amount) : 0;
-                mysqli_query($conn, "INSERT INTO product_costs (product_id, lot_no, production_order_id, total_cost, cost_per_unit) 
-                                     VALUES ('$p_id', '$lot_no', '$order_id', '$total_production_cost', '$cost_per_unit')");
-
-                // 🚀 บันทึกประวัติ Log ลงระบบ (ใส่เพิ่มตรงนี้ครับ)
-                if(function_exists('log_event')) {
-                    log_event($conn, 'INSERT', 'inventory_lots', "บันทึกผลิต $formula_name สำเร็จ $amount หน่วย (Lot: $lot_no) ต้นทุนรวม " . number_format($total_production_cost, 2) . " ฿");
-                }
-
-                // แจ้งเตือน LINE ไปหา QA
-                include_once '../line_api.php';
-                $msg = "🏭 [ฝ่ายผลิต] บันทึกการผลิตสำเร็จเรียบร้อย\n\n";
-                $msg .= "🔖 ใบสั่งผลิต: $order_no\n";
-                $msg .= "📦 สินค้า: $formula_name\n";
-                $msg .= "✅ จำนวนที่ได้: " . number_format($amount, 2) . " หน่วย\n\n";
-                $msg .= "⚠️ สถานะ: รอกักกันตรวจสอบคุณภาพ (Pending QA) ก่อนนำเข้าสต็อกหลัก\n";
-                $msg .= "👉 ฝ่าย QA โปรดตรวจสอบคุณภาพ Lot: $lot_no";
-                
-                if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
-
-                $status = 'success';
-            } else if (!$can_produce) {
-                $status = 'error';
-                $message = $missing_msg;
-            } else {
-                $status = 'warning';
-                $message = 'สินค้านี้ยังไม่ได้ตั้งค่าสูตรการผลิต (BOM) ในระบบ ทำให้ไม่สามารถคำนวณการตัดสต็อกได้';
-            }
-        }
-    }
-}
-
 // 🚀 API สำหรับดึงข้อมูลคำนวณต้นทุน (เมื่อเลือก Dropdown จะโหลดข้อมูลราคาวัตถุดิบ)
 if (isset($_GET['api_cost']) && isset($_GET['order_id'])) {
     $oid = (int)$_GET['order_id'];
-    $q_ord = mysqli_query($conn, "SELECT target_qty, formula_name FROM production_orders WHERE id = $oid");
+    $q_ord = mysqli_query($conn, "SELECT product_id, formula_name, target_qty FROM production_orders WHERE id = $oid");
+    
     if ($q_ord && mysqli_num_rows($q_ord) > 0) {
         $ord = mysqli_fetch_assoc($q_ord);
         $amount = (float)$ord['target_qty'];
+        $p_id = (int)$ord['product_id'];
         $fname = mysqli_real_escape_string($conn, $ord['formula_name']);
         
-        $q_p = mysqli_query($conn, "SELECT id FROM products WHERE p_name = '$fname' LIMIT 1");
-        $pid = mysqli_fetch_assoc($q_p)['id'] ?? 0;
-        
-        $formulas = mysqli_query($conn, "SELECT f.ingredient_id, f.quantity_required, p.p_name FROM formulas f JOIN products p ON f.ingredient_id = p.id WHERE f.product_id = '$pid'");
+        // 🚀 ดึงสูตรโดยอิงจาก product_id และ formula_name (รองรับ 1 สินค้า หลายสูตร)
+        $formulas = mysqli_query($conn, "SELECT f.ingredient_id, f.quantity_required, p.p_name 
+                                         FROM formulas f 
+                                         JOIN products p ON f.ingredient_id = p.id 
+                                         WHERE f.product_id = '$p_id' AND f.formula_name = '$fname'");
         
         $total_cost = 0;
         $materials = [];
@@ -164,6 +54,7 @@ if (isset($_GET['api_cost']) && isset($_GET['order_id'])) {
             $need = $f['quantity_required'] * $amount;
             $ing_id = $f['ingredient_id'];
             
+            // ดึงราคาซื้อล่าสุด
             $q_price = mysqli_query($conn, "SELECT unit_price FROM po_items JOIN purchase_orders po ON po_items.po_id = po.po_id WHERE item_id = '$ing_id' AND po.status IN ('Delivered', 'Completed') ORDER BY po.created_at DESC LIMIT 1");
             $unit_price = (mysqli_num_rows($q_price) > 0) ? (float)mysqli_fetch_assoc($q_price)['unit_price'] : 0;
             
@@ -186,6 +77,113 @@ if (isset($_GET['api_cost']) && isset($_GET['order_id'])) {
             'materials' => $materials
         ]);
         exit;
+    }
+}
+
+// 🚀 ประมวลผลเมื่อกดปุ่ม "ยืนยันการผลิต"
+if (isset($_POST['start_production'])) {
+    $order_id = (int)$_POST['order_id'];
+    $amount = (float)$_POST['amount'];
+    $user = $_SESSION['fullname'];
+
+    $q_order = mysqli_query($conn, "SELECT order_no, product_id, formula_name FROM production_orders WHERE id = $order_id");
+    if(mysqli_num_rows($q_order) > 0) {
+        $order_data = mysqli_fetch_assoc($q_order);
+        $p_id = (int)$order_data['product_id'];
+        $formula_name = mysqli_real_escape_string($conn, $order_data['formula_name']);
+        $order_no = $order_data['order_no'];
+
+        // ดึงอายุการเก็บรักษาของสินค้านั้น
+        $q_prod = mysqli_query($conn, "SELECT shelf_life_days FROM products WHERE id = '$p_id'");
+        $shelf_life = (mysqli_num_rows($q_prod) > 0) ? (int)mysqli_fetch_assoc($q_prod)['shelf_life_days'] : 0;
+
+        // 🚀 ดึงสูตรที่ต้องใช้ (อิงตามชื่อสูตร)
+        $formulas = mysqli_query($conn, "SELECT f.ingredient_id, f.quantity_required, p.p_name, p.p_qty, p.p_code 
+                                         FROM formulas f 
+                                         JOIN products p ON f.ingredient_id = p.id 
+                                         WHERE f.product_id = '$p_id' AND f.formula_name = '$formula_name'");
+        
+        $can_produce = true;
+        $items_to_deduct = [];
+        $total_production_cost = 0; 
+        
+        $missing_msg = "<ul style='text-align: left; padding-left: 20px; margin-top: 10px; color: #475569; font-size: 15px;'>";
+
+        while ($f = mysqli_fetch_assoc($formulas)) {
+            $need = $f['quantity_required'] * $amount;
+            
+            // เช็คว่าสต็อกพอไหม
+            if ($f['p_qty'] < $need) {
+                $can_produce = false;
+                $missing = $need - $f['p_qty'];
+                $missing_msg .= "<li style='margin-bottom: 8px;'><b>{$f['p_name']}</b> <br>ขาดอีก <span style='color: #ef4444; font-weight: bold;'>" . number_format($missing, 3) . "</span> กก.</li>";
+            } else {
+                $ing_id = $f['ingredient_id'];
+                $q_price = mysqli_query($conn, "SELECT unit_price FROM po_items 
+                                                JOIN purchase_orders po ON po_items.po_id = po.po_id 
+                                                WHERE item_id = '$ing_id' AND po.status IN ('Delivered', 'Completed') 
+                                                ORDER BY po.created_at DESC LIMIT 1");
+                $unit_price = ($q_price && mysqli_num_rows($q_price) > 0) ? (float)mysqli_fetch_assoc($q_price)['unit_price'] : 0;
+                
+                $item_cost = $need * $unit_price;
+                $total_production_cost += $item_cost;
+
+                $items_to_deduct[] = [
+                    'id' => $ing_id, 
+                    'qty' => $need, 
+                    'code' => $f['p_code']
+                ];
+            }
+        }
+        $missing_msg .= "</ul>";
+
+        if ($can_produce && count($items_to_deduct) > 0) {
+            // 1. หักสต็อกวัตถุดิบ
+            foreach ($items_to_deduct as $item) {
+                mysqli_query($conn, "UPDATE products SET p_qty = p_qty - {$item['qty']} WHERE id = {$item['id']}");
+                mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, reference, action_by) 
+                                     VALUES ('{$item['id']}', 'OUT', '{$item['qty']}', 'ผลิตสินค้า FG-#$p_id', '$user')");
+            }
+            
+            // 2. สร้าง LOT เข้าสถานะกักกันตรวจสอบ (Pending_QA)
+            $lot_no = "LOT-" . date('Ymd') . "-" . str_pad($order_id, 4, "0", STR_PAD_LEFT);
+            $mfg_date = date('Y-m-d'); 
+            $exp_date = ($shelf_life > 0) ? date('Y-m-d', strtotime($mfg_date. " + {$shelf_life} days")) : '2099-12-31'; 
+
+            mysqli_query($conn, "INSERT INTO inventory_lots (product_id, lot_no, mfg_date, exp_date, qty, status) 
+                                 VALUES ('$p_id', '$lot_no', '$mfg_date', '$exp_date', '$amount', 'Pending_QA')");
+
+            mysqli_query($conn, "UPDATE production_orders SET status = 'Completed' WHERE id = $order_id");
+
+            // 3. บันทึกต้นทุนลงตาราง product_costs
+            $cost_per_unit = ($amount > 0) ? ($total_production_cost / $amount) : 0;
+            mysqli_query($conn, "INSERT INTO product_costs (product_id, lot_no, production_order_id, total_cost, cost_per_unit) 
+                                 VALUES ('$p_id', '$lot_no', '$order_id', '$total_production_cost', '$cost_per_unit')");
+
+            // บันทึก Log
+            if(function_exists('log_event')) {
+                log_event($conn, 'INSERT', 'inventory_lots', "บันทึกผลิต $formula_name สำเร็จ $amount หน่วย (Lot: $lot_no) ต้นทุนรวม " . number_format($total_production_cost, 2) . " ฿");
+            }
+
+            // แจ้งเตือน LINE ไปหา QA
+            include_once '../line_api.php';
+            $msg = "🏭 [ฝ่ายผลิต] บันทึกการผลิตสำเร็จเรียบร้อย\n\n";
+            $msg .= "🔖 ใบสั่งผลิต: $order_no\n";
+            $msg .= "📦 สินค้า: $formula_name\n";
+            $msg .= "✅ จำนวนที่ได้: " . number_format($amount, 2) . " หน่วย\n\n";
+            $msg .= "⚠️ สถานะ: รอกักกันตรวจสอบคุณภาพ (Pending QA) ก่อนนำเข้าสต็อกหลัก\n";
+            $msg .= "👉 ฝ่าย QA โปรดตรวจสอบคุณภาพ Lot: $lot_no";
+            
+            if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
+
+            $status = 'success';
+        } else if (!$can_produce) {
+            $status = 'error';
+            $message = $missing_msg;
+        } else {
+            $status = 'warning';
+            $message = 'สินค้านี้ยังไม่ได้ตั้งค่าสูตรการผลิต (BOM) ในระบบ ทำให้ไม่สามารถคำนวณการตัดสต็อกได้';
+        }
     }
 }
 
@@ -235,7 +233,8 @@ include '../sidebar.php';
 
         <?php
         $dept_filter = ($user_role === 'ADMIN') ? "" : "AND production_line = '$user_dept'";
-        $q_orders = mysqli_query($conn, "SELECT * FROM production_orders WHERE status = 'Pending' $dept_filter ORDER BY due_date ASC");
+        // JOIN ดึงชื่อสินค้ามาแสดงให้ฝ่ายผลิตเห็นภาพชัดเจน
+        $q_orders = mysqli_query($conn, "SELECT po.*, p.p_name FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.status = 'Pending' $dept_filter ORDER BY po.due_date ASC");
         
         if(mysqli_num_rows($q_orders) > 0):
         ?>
@@ -246,7 +245,7 @@ include '../sidebar.php';
                     <option value="">-- เลือกใบสั่งผลิต --</option>
                     <?php 
                     while($row = mysqli_fetch_assoc($q_orders)) { 
-                        echo "<option value='{$row['id']}'>📦 [{$row['order_no']}] {$row['formula_name']}</option>"; 
+                        echo "<option value='{$row['id']}'>📦 [{$row['order_no']}] {$row['p_name']} (สูตร: {$row['formula_name']})</option>"; 
                     }
                     ?>
                 </select>
@@ -279,7 +278,7 @@ include '../sidebar.php';
             </button>
         </form>
         <?php else: ?>
-            <div style="text-align:center; padding:30px; background:#f8fafc; border-radius:12px; border:1px dashed #cbd5e1;"><i class="fa-solid fa-check-circle" style="font-size:40px; color:#10b981; margin-bottom:15px;"></i><h3>ไม่มีงานค้าง</h3></div>
+            <div style="text-align:center; padding:30px; background:#f8fafc; border-radius:12px; border:1px dashed #cbd5e1;"><i class="fa-solid fa-check-circle" style="font-size:40px; color:#10b981; margin-bottom:15px;"></i><h3>ไม่มีงานค้าง</h3><p style="color:#64748b;">แผนกของคุณผลิตตามเป้าหมายเสร็จสิ้นหมดแล้ว</p></div>
         <?php endif; ?>
     </div>
 </div>
@@ -331,3 +330,5 @@ include '../sidebar.php';
         Swal.fire({ icon: 'error', title: 'วัตถุดิบไม่เพียงพอ!', html: "<?php echo $message; ?>" });
     <?php endif; ?>
 </script>
+</body>
+</html>
