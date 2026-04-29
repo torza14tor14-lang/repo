@@ -16,6 +16,7 @@ if ($user_role !== 'ADMIN' && $user_role !== 'MANAGER' && !in_array($user_dept, 
     echo "<script>alert('เฉพาะแผนกควบคุมคุณภาพเท่านั้น'); window.location='../index.php';</script>"; exit(); 
 }
 
+// เช็คตาราง qa_outbound_logs ของคุณที่มีอยู่เดิม
 $check_table = mysqli_query($conn, "SHOW TABLES LIKE 'qa_outbound_logs'");
 if ($check_table && mysqli_num_rows($check_table) == 0) {
     mysqli_query($conn, "CREATE TABLE qa_outbound_logs (
@@ -47,7 +48,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['save_qa'])) {
 
     $is_rma = (strpos($lot_no, 'RMA-') === 0);
 
-    // บันทึกผลแล็บลงฐานข้อมูล QA
+    // บันทึกผลแล็บลงตาราง qa_outbound_logs ของคุณ
     $sql_log = "INSERT INTO qa_outbound_logs (order_id, lot_no, moisture, protein, appearance, qa_status, remark, inspector_name) 
                 VALUES ($order_id, '$lot_no', $moisture, $protein, '$appearance', '$qa_status', '$remark', '$fullname')";
             
@@ -100,154 +101,253 @@ include '../sidebar.php';
 <html lang="th">
 <head>
     <meta charset="UTF-8">
-    <title>Top Feed Mills | ตรวจสินค้าสำเร็จรูป (QA)</title>
+    <title>ตรวจสอบคุณภาพสินค้า (QA Outbound) | Top Feed Mills</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <style>
-        .wrapper { font-family: 'Sarabun', sans-serif; animation: fadeIn 0.5s ease-in-out; }
-        .card { background: #ffffff; padding: 25px 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.03); margin-bottom: 25px;}
-        h3 { color: #2c3e50; margin-top: 0; margin-bottom: 20px; font-weight: 600; border-bottom: 2px solid #f1f2f6; padding-bottom: 12px;}
-        .table-responsive { overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; min-width: 900px; }
-        th { background: #f8f9fa; color: #4e73df; padding: 15px; text-align: left; }
-        td { padding: 15px; border-bottom: 1px solid #f0f0f0; }
-        .btn-cens { background: linear-gradient(135deg, #c81c1c 0%, #851313 100%); color: white; border: none; padding: 8px 15px; border-radius: 8px; cursor: pointer; font-family: 'Sarabun'; font-weight:bold;}
-        .btn-inspect { background: linear-gradient(135deg, #1cc88a 0%, #13855c 100%); color: white; border: none; padding: 8px 15px; border-radius: 8px; cursor: pointer; font-family: 'Sarabun'; font-weight:bold;}
-        .badge-status { padding: 5px 12px; border-radius: 50px; font-size: 12px; font-weight: bold; }
-        .st-approved { background: #d4edda; color: #155724; } .st-rejected { background: #f8d7da; color: #721c24; }
-        .st-rma { background: #e3f2fd; color: #0d47a1; border: 1px solid #bbdefb; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(2px);}
-        .modal-content { background: white; border-radius: 16px; width: 90%; max-width: 600px; padding: 25px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: pop 0.3s ease; }
+        :root { 
+            --primary: #10b981; --primary-hover: #059669; --primary-light: #d1fae5;
+            --danger: #ef4444; --warning: #f59e0b; --info: #3b82f6;
+            --bg-color: #f8fafc; --card-bg: #ffffff; --border-color: #e2e8f0;
+            --text-main: #1e293b; --text-muted: #64748b;
+        }
+        body { font-family: 'Sarabun', sans-serif; background-color: var(--bg-color); }
+        .content-padding { padding: 24px; width: 100%; box-sizing: border-box; max-width: 1400px; margin: auto;}
+        
+        .card-qa { background: var(--card-bg); padding: 30px; border-radius: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.04); border: 1px solid var(--border-color); margin-bottom: 25px; width: 100%; }
+        
+        h3 { display: flex; align-items: center; gap: 10px; margin-top: 0; margin-bottom: 20px; color: var(--text-main); font-weight: 800; font-size: 20px;}
+        
+        /* Table Styles */
+        .table-responsive { width: 100%; overflow-x: auto; border-radius: 12px; border: 1px solid var(--border-color); }
+        table.display-table { width: 100%; border-collapse: collapse; min-width: 900px; }
+        table.display-table th { background: #f8fafc; color: var(--text-muted); font-size: 13.5px; text-transform: uppercase; font-weight: 700; padding: 15px 20px; border-bottom: 2px solid var(--border-color); text-align: left; }
+        table.display-table td { padding: 16px 20px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; font-size: 15px; font-weight: 500; color: var(--text-main); }
+        table.display-table tr:hover td { background-color: #f8fafc; }
+
+        /* Badges */
+        .badge { padding: 6px 14px; border-radius: 50px; font-size: 13px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
+        .bg-pending { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
+        .bg-active { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .bg-reject { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .st-rma { background: #e0f2fe; color: #0369a1; border: 1px solid #bae6fd; padding: 4px 10px; border-radius: 6px; font-size: 13px; font-weight: 700; display: inline-block;}
+
+        .btn-action { background: var(--primary); color: white; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 700; cursor: pointer; transition: 0.2s; font-family: 'Sarabun'; display: inline-flex; align-items: center; gap: 6px; font-size: 14px;}
+        .btn-action:hover { background: var(--primary-hover); transform: translateY(-2px); box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3); }
+
+        /* Modal Styles */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 23, 42, 0.6); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+        .modal-content { background: white; border-radius: 20px; width: 90%; max-width: 600px; padding: 30px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
         @keyframes pop { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-        .form-control { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; margin-bottom: 15px; box-sizing: border-box; font-family: 'Sarabun';}
+        
+        .form-group { margin-bottom: 20px; }
+        .form-label { display: block; font-size: 14.5px; font-weight: 700; color: var(--text-main); margin-bottom: 8px; }
+        .form-control { width: 100%; padding: 12px 16px; border: 1.5px solid var(--border-color); border-radius: 10px; font-family: 'Sarabun'; font-size: 15px; transition: 0.2s; box-sizing: border-box;}
+        .form-control:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15); }
+        
+        .btn-submit { background: var(--primary); color: white; width: 100%; padding: 14px; border: none; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.3s; font-family: 'Sarabun';}
+        .btn-submit:hover { background: var(--primary-hover); transform: translateY(-2px); }
+        .btn-cancel { background: #fef2f2; color: #ef4444; width: 100%; padding: 14px; border: none; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.3s; font-family: 'Sarabun';}
+        .btn-cancel:hover { background: #fecaca; }
+
+        .info-box { background: #f8fafc; border: 1px dashed #cbd5e1; padding: 15px; border-radius: 12px; margin-bottom: 20px; }
     </style>
 </head>
 <body>
 
 <div class="content-padding">
-    <div class="wrapper">
-        <div class="card" style="border-top: 4px solid #f6c23e;">
-            <h3><i class="fa-solid fa-microscope" style="color: #f6c23e;"></i> สินค้าสำเร็จรูป (รอกักกันตรวจสอบคุณภาพ)</h3>
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ประเภท</th>
-                            <th>LOT No. (จากผลิต/คลัง)</th>
-                            <th>สินค้า (Formula)</th>
-                            <th>ปริมาณ</th>
-                            <th>สถานะ QA</th>
-                            <th style="text-align:right;">ดำเนินการ</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php
-                        // ดึงข้อมูลทั้ง LOT ที่ผลิตใหม่ (LOT-) และ LOT ที่ลูกค้าตีกลับ (RMA-)
-                        $sql_pending = "SELECT l.id, l.lot_no, l.qty, l.product_id, p.p_name 
-                                        FROM inventory_lots l 
-                                        JOIN products p ON l.product_id = p.id 
-                                        WHERE l.status = 'Pending_QA' AND (l.lot_no LIKE 'LOT-%' OR l.lot_no LIKE 'RMA-%') 
-                                        ORDER BY l.id ASC";
-                        $res_pending = mysqli_query($conn, $sql_pending);
-                        
-                        if ($res_pending && mysqli_num_rows($res_pending) > 0) {
-                            while($row = mysqli_fetch_assoc($res_pending)) {
-                                $is_rma = (strpos($row['lot_no'], 'RMA-') === 0);
-                                $type_badge = $is_rma ? "<span class='badge-status st-rma'><i class='fa-solid fa-arrow-rotate-left'></i> รับคืนจากลูกค้า</span>" : "<span style='color:#888; font-size:13px;'><i class='fa-solid fa-industry'></i> ผลิตใหม่</span>";
-                                
-                                // สกัดเอา Order ID ออกมาจาก Lot (ถ้ามี)
-                                $order_id = 0;
-                                if (!$is_rma) {
-                                    $parts = explode('-', $row['lot_no']);
-                                    if(isset($parts[2])) $order_id = (int)$parts[2];
-                                }
-                        ?>
-                                <tr>
-                                    <td><?= $type_badge ?></td>
-                                    <td><span style="background:#e3f2fd; color:#4e73df; padding:4px 8px; border-radius:4px; font-weight:bold;"><?= $row['lot_no'] ?></span></td>
-                                    <td><strong><?= htmlspecialchars($row['p_name']) ?></strong></td>
-                                    <td><strong style="color:#e74a3b;"><?= number_format($row['qty'], 2) ?></strong></td>
-                                    <td><span class="badge-status" style="background:#fff3cd; color:#856404;">รอกักกันตรวจสอบ</span></td>
-                                    <td style="text-align:right;">
-                                        <button class="btn-inspect" onclick="openQAModal('<?= $order_id ?>', '<?= $row['product_id'] ?>', '<?= htmlspecialchars($row['p_name']) ?>', '<?= $row['qty'] ?>', '<?= $row['lot_no'] ?>')">
-                                            <i class="fa-solid fa-flask-vial"></i> บันทึกผล
-                                        </button>
-                                    </td>
-                                </tr>
-                        <?php 
-                            } 
-                        } else { echo "<tr><td colspan='6' style='text-align:center; color:#888; padding:30px;'><i class='fa-solid fa-check-circle fa-2x' style='color:#1cc88a; margin-bottom:10px;'></i><br>ไม่มีสินค้าที่รอการตรวจสอบ</td></tr>"; }
-                        ?>
-                    </tbody>
-                </table>
-            </div>
-        </div>
+    
+    <div class="card-qa" style="border-top: 5px solid var(--warning);">
+        <h3><i class="fa-solid fa-microscope" style="color:var(--warning);"></i> สินค้าสำเร็จรูปที่รอการตรวจสอบ (Pending QA Release)</h3>
+        <p style="color: var(--text-muted); font-size: 14px; margin-top: -10px; margin-bottom: 20px;">สินค้าเหล่านี้ผลิตเสร็จแล้ว หรือลูกค้ารับคืนมา แต่ยังไม่สามารถนำไปขายได้จนกว่า QA จะกดอนุมัติ (Pass)</p>
 
-        <div class="card" style="border-top: 4px solid #4e73df;">
-            <h3><i class="fa-solid fa-file-certificate"></i> ประวัติการตรวจสอบ (History)</h3>
-            <div class="table-responsive">
-                <table>
-                    <tr><th>วันที่ตรวจ</th><th>Lot No. / สินค้า</th><th>ผลแล็บ</th><th>ผู้ตรวจ</th><th>สถานะ</th></tr>
+        <div class="table-responsive">
+            <table class="display-table">
+                <thead>
+                    <tr>
+                        <th width="20%">ประเภท / วันที่ผลิต</th>
+                        <th width="20%">LOT Number</th>
+                        <th width="30%">สินค้า (Product)</th>
+                        <th width="15%">ปริมาณ</th>
+                        <th width="15%" style="text-align:right;">ดำเนินการ</th>
+                    </tr>
+                </thead>
+                <tbody>
                     <?php
-                    $res_history = mysqli_query($conn, "SELECT qa.*, p.p_name FROM qa_outbound_logs qa LEFT JOIN inventory_lots l ON qa.lot_no = l.lot_no LEFT JOIN products p ON l.product_id = p.id ORDER BY qa.id DESC LIMIT 50");
-                    if ($res_history && mysqli_num_rows($res_history) > 0) {
-                        while($row = mysqli_fetch_assoc($res_history)) {
-                            $badge = ($row['qa_status'] == 'Approved') ? "<span class='badge-status st-approved'>ผ่าน (นำเข้าคลัง)</span>" : "<span class='badge-status st-rejected'>ไม่ผ่าน (ทำลายทิ้ง)</span>";
-                            $pname = $row['p_name'] ?? 'ไม่ทราบข้อมูลสินค้า';
-                            echo "<tr>
-                                    <td>".date('d/m/Y H:i', strtotime($row['inspected_at']))."</td>
-                                    <td><strong>{$row['lot_no']}</strong><br>{$pname}</td>
-                                    <td>ชื้น: {$row['moisture']}% | โปรตีน: {$row['protein']}%</td>
-                                    <td>{$row['inspector_name']}</td><td>{$badge}</td>
-                                  </tr>";
-                        }
-                    } else { echo "<tr><td colspan='5' style='text-align:center;'>ยังไม่มีประวัติ</td></tr>"; }
+                    // ดึงข้อมูลทั้ง LOT ที่ผลิตใหม่ (LOT-) และ LOT ที่ลูกค้าตีกลับ (RMA-)
+                    $sql_pending = "SELECT l.id, l.lot_no, l.qty, l.product_id, l.mfg_date, p.p_name 
+                                    FROM inventory_lots l 
+                                    JOIN products p ON l.product_id = p.id 
+                                    WHERE l.status = 'Pending_QA' AND (l.lot_no LIKE 'LOT-%' OR l.lot_no LIKE 'RMA-%') 
+                                    ORDER BY l.id ASC";
+                    $res_pending = mysqli_query($conn, $sql_pending);
+                    
+                    if ($res_pending && mysqli_num_rows($res_pending) > 0) {
+                        while($row = mysqli_fetch_assoc($res_pending)) {
+                            $is_rma = (strpos($row['lot_no'], 'RMA-') === 0);
+                            $type_badge = $is_rma ? "<span class='st-rma'><i class='fa-solid fa-arrow-rotate-left'></i> รับคืนจากลูกค้า</span>" : "<span style='color:#64748b; font-size:14px; font-weight:bold;'><i class='fa-solid fa-industry'></i> ผลิตใหม่</span>";
+                            
+                            // สกัดเอา Order ID ออกมาจาก Lot (ถ้ามี)
+                            $order_id = 0;
+                            if (!$is_rma) {
+                                $parts = explode('-', $row['lot_no']);
+                                if(isset($parts[2])) $order_id = (int)$parts[2];
+                            }
                     ?>
-                </table>
-            </div>
+                        <tr>
+                            <td>
+                                <?= $type_badge ?><br>
+                                <small style="color: var(--text-muted);">ว/ด/ป: <?= date('d/m/Y', strtotime($row['mfg_date'])) ?></small>
+                            </td>
+                            <td>
+                                <strong style="color: var(--info); font-size:15px; background: #e0f2fe; padding: 4px 10px; border-radius: 6px;"><?= $row['lot_no'] ?></strong>
+                            </td>
+                            <td>
+                                <strong style="font-size:16px; color:var(--text-main);"><i class="fa-solid fa-box-open" style="color:#94a3b8; margin-right:5px;"></i><?= htmlspecialchars($row['p_name']) ?></strong>
+                            </td>
+                            <td>
+                                <strong style="color:var(--danger); font-size:16px;"><?= number_format($row['qty'], 2) ?></strong>
+                            </td>
+                            <td align="right">
+                                <button class="btn-action" onclick="openQAModal('<?= $order_id ?>', '<?= $row['product_id'] ?>', '<?= htmlspecialchars($row['p_name']) ?>', '<?= $row['qty'] ?>', '<?= $row['lot_no'] ?>')">
+                                    <i class="fa-solid fa-flask-vial"></i> บันทึกผลแล็บ
+                                </button>
+                            </td>
+                        </tr>
+                    <?php 
+                        }
+                    } else { 
+                        echo "<tr><td colspan='5' style='text-align:center; padding:50px; color:var(--text-muted);'><i class='fa-solid fa-check-circle fa-3x' style='margin-bottom:15px; color:#10b981;'></i><br>ไม่มีสินค้าที่รอการตรวจสอบ</td></tr>";
+                    } 
+                    ?>
+                </tbody>
+            </table>
         </div>
     </div>
+
+    <div class="card-qa" style="border-top: 5px solid var(--info);">
+        <h3><i class="fa-solid fa-file-certificate" style="color:var(--info);"></i> ประวัติการตรวจสอบสินค้า (QA History)</h3>
+        
+        <div class="table-responsive">
+            <table class="display-table">
+                <thead>
+                    <tr>
+                        <th width="15%">วัน/เวลา ที่ตรวจ</th>
+                        <th width="30%">Lot No. / สินค้า</th>
+                        <th width="25%">ผลแล็บ (Lab Results)</th>
+                        <th width="15%">ผู้ตรวจ</th>
+                        <th width="15%">สถานะ</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    // ดึงประวัติจากตาราง qa_outbound_logs ของคุณ
+                    $res_history = mysqli_query($conn, "SELECT qa.*, p.p_name 
+                                                        FROM qa_outbound_logs qa 
+                                                        LEFT JOIN inventory_lots l ON qa.lot_no = l.lot_no 
+                                                        LEFT JOIN products p ON l.product_id = p.id 
+                                                        ORDER BY qa.id DESC LIMIT 50");
+                    if ($res_history && mysqli_num_rows($res_history) > 0) {
+                        while($row = mysqli_fetch_assoc($res_history)) {
+                            $badge = ($row['qa_status'] == 'Approved') ? "<span class='badge bg-active'><i class='fa-solid fa-check-circle'></i> ผ่าน (เข้าคลัง)</span>" : "<span class='badge bg-reject'><i class='fa-solid fa-xmark-circle'></i> ไม่ผ่าน (ทำลาย)</span>";
+                            $pname = $row['p_name'] ?? 'ไม่ทราบข้อมูลสินค้า';
+                    ?>
+                        <tr>
+                            <td><small style="color:var(--text-muted);"><?= date('d/m/Y H:i', strtotime($row['inspected_at'])) ?></small></td>
+                            <td>
+                                <strong style="color: var(--text-main); font-size:15px;"><?= $row['lot_no'] ?></strong><br>
+                                <span style="color: var(--text-muted); font-size:14px;"><?= $pname ?></span>
+                            </td>
+                            <td>
+                                <span style="font-size:14px; color:#475569;">ชื้น: <strong style="color:#0ea5e9;"><?= $row['moisture'] ?>%</strong> | โปรตีน: <strong style="color:#10b981;"><?= $row['protein'] ?>%</strong></span><br>
+                                <?php if(!empty($row['remark'])): ?>
+                                    <small style="color: var(--danger); display:block; margin-top:4px;"><i class="fa-solid fa-circle-exclamation"></i> <?= htmlspecialchars($row['remark']) ?></small>
+                                <?php endif; ?>
+                            </td>
+                            <td><small><i class="fa-solid fa-user-shield" style="color:#94a3b8; margin-right:5px;"></i><?= htmlspecialchars($row['inspector_name']) ?></small></td>
+                            <td><?= $badge ?></td>
+                        </tr>
+                    <?php 
+                        }
+                    } else { 
+                        echo "<tr><td colspan='5' style='text-align:center; padding:40px; color:var(--text-muted);'>ยังไม่มีประวัติการตรวจสอบ</td></tr>";
+                    } 
+                    ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
 </div>
 
 <div id="qaModal" class="modal-overlay">
     <div class="modal-content">
-        <h3 style="color:#4e73df; border-bottom:1px solid #ddd; padding-bottom:10px;">บันทึกผลวิเคราะห์</h3>
-        <form method="POST">
+        <h3 style="margin-top:0; color:var(--text-main); font-size:22px;"><i class="fa-solid fa-microscope" style="color:var(--primary);"></i> บันทึกผลแล็บวิเคราะห์ (Lab Result)</h3>
+        
+        <div class="info-box">
+            <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 3px;">สินค้าสำเร็จรูป:</div>
+            <div style="font-size: 16px; font-weight: bold; color: var(--text-main);" id="qa_product_name"></div>
+            
+            <div style="display:flex; justify-content:space-between; margin-top:10px;">
+                <div>
+                    <div style="font-size: 13px; color: var(--text-muted);">LOT Number:</div>
+                    <div style="font-size: 15px; font-weight: bold; color: var(--info);" id="qa_lot_display"></div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size: 13px; color: var(--text-muted);">จำนวนที่จะอนุมัติ:</div>
+                    <div style="font-size: 15px; font-weight: bold; color: var(--danger);" id="qa_qty"></div>
+                </div>
+            </div>
+        </div>
+        
+        <form method="POST" onsubmit="return confirm('ยืนยันผลการตรวจ? ระบบจะอัปเดตสต็อกทันที');">
             <input type="hidden" name="order_id" id="qa_order_id">
             <input type="hidden" name="product_id" id="qa_product_id">
             <input type="hidden" name="lot_no" id="qa_lot_no">
             <input type="hidden" name="qty" id="qa_qty_val">
-
-            <div style="background:#f8f9fc; padding:15px; border-radius:8px; margin-bottom:15px;">
-                สินค้า: <strong id="qa_product_name" style="font-size:16px;"></strong> (<span id="qa_qty" style="color:#e74a3b; font-weight:bold;"></span>)<br>
-                LOT: <strong id="qa_lot_display" style="color:#4e73df; font-size:15px;"></strong>
+            
+            <div style="display:flex; gap:15px;">
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">ความชื้น (%) <span style="color:red;">*</span></label>
+                    <input type="number" step="0.01" name="moisture" class="form-control" placeholder="เช่น 12.5" required>
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">โปรตีน (%) <span style="color:red;">*</span></label>
+                    <input type="number" step="0.01" name="protein" class="form-control" placeholder="เช่น 18.0" required>
+                </div>
             </div>
 
-            <div style="display:flex; gap:10px;">
-                <div style="flex:1;"><label>ความชื้น %</label><input type="number" step="0.01" name="moisture" class="form-control" required></div>
-                <div style="flex:1;"><label>โปรตีน %</label><input type="number" step="0.01" name="protein" class="form-control" required></div>
+            <div class="form-group">
+                <label class="form-label">ลักษณะทางกายภาพ <span style="color:red;">*</span></label>
+                <select name="appearance" class="form-control" required>
+                    <option value="ปกติ">ปกติ (สี กลิ่น ขนาดเม็ด ผ่านเกณฑ์)</option>
+                    <option value="ผิดปกติ">ผิดปกติ (พบสิ่งเจือปน / มอด / แมลง)</option>
+                </select>
             </div>
             
-            <label>กายภาพ</label>
-            <select name="appearance" class="form-control"><option value="ปกติ">ปกติ (ไม่มีมอด/แมลง)</option><option value="ผิดปกติ">ผิดปกติ (พบสิ่งเจือปน)</option></select>
+            <div class="form-group">
+                <label class="form-label">สถานะ (การตัดสินใจ) <span style="color:red;">*</span></label>
+                <select name="qa_status" id="mod_status" class="form-control" required onchange="toggleRemark()">
+                    <option value="">-- เลือกผลการตัดสิน --</option>
+                    <option value="Approved" style="color:#059669; font-weight:bold;">✅ ผ่าน (Approved / นำเข้าสต็อกคลังพร้อมขาย)</option>
+                    <option value="Rejected" style="color:#dc2626; font-weight:bold;">❌ ไม่ผ่าน (Rejected / ทำลาย LOT ทิ้งเป็นของเสีย)</option>
+                </select>
+            </div>
             
-            <label>สถานะ (การตัดสินใจ) <span style="color:red;">*</span></label>
-            <select name="qa_status" class="form-control" style="font-weight:bold; font-size:15px;" required>
-                <option value="Approved" style="color:green;">✅ ผ่าน (นำเข้าสต็อกคลังพร้อมขาย)</option>
-                <option value="Rejected" style="color:red;">❌ ไม่ผ่าน (ทำลาย LOT ทิ้งเป็นของเสีย)</option>
-            </select>
+            <div class="form-group">
+                <label class="form-label">หมายเหตุ <span id="remark_req" style="color:red; display:none;">* (บังคับใส่เมื่อไม่ผ่าน)</span></label>
+                <textarea name="remark" id="mod_remark" class="form-control" rows="2" placeholder="ระบุเหตุผล หากไม่ผ่าน..."></textarea>
+            </div>
             
-            <label>หมายเหตุ</label>
-            <input type="text" name="remark" class="form-control" placeholder="ระบุเหตุผล หากไม่ผ่าน...">
-            
-            <div style="display:flex; gap:10px; margin-top:10px;">
-                <button type="button" class="btn-cens" style="width:100%; font-size:16px;" onclick="document.getElementById('qaModal').style.display='none'">ยกเลิก</button>
-                <button type="submit" name="save_qa" class="btn-inspect" style="width:100%; font-size:16px;" onclick="return confirm('ยืนยันผลการตรวจ? ระบบจะอัปเดตสต็อกทันที')">บันทึกผลตรวจสอบ</button>
+            <div style="display: flex; gap: 15px; margin-top: 25px;">
+                <button type="button" class="btn-cancel" onclick="closeModal()">ยกเลิก</button>
+                <button type="submit" name="save_qa" class="btn-submit">บันทึกผลตรวจสอบ</button>
             </div>
         </form>
     </div>
 </div>
 
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 <script>
     function openQAModal(oid, pid, name, qty, lot) {
         document.getElementById('qa_order_id').value = oid;
@@ -259,12 +359,36 @@ include '../sidebar.php';
         document.getElementById('qa_product_name').innerText = name;
         document.getElementById('qa_qty').innerText = qty + ' หน่วย';
         
+        document.getElementById('mod_status').value = '';
+        document.getElementById('mod_remark').value = '';
+        document.getElementById('mod_remark').required = false;
+        document.getElementById('remark_req').style.display = 'none';
+
         document.getElementById('qaModal').style.display = 'flex';
     }
+
+    function closeModal() {
+        document.getElementById('qaModal').style.display = 'none';
+    }
+
+    function toggleRemark() {
+        let status = document.getElementById('mod_status').value;
+        let remarkField = document.getElementById('mod_remark');
+        let remarkReq = document.getElementById('remark_req');
+        
+        if (status === 'Rejected') {
+            remarkField.required = true;
+            remarkReq.style.display = 'inline';
+        } else {
+            remarkField.required = false;
+            remarkReq.style.display = 'none';
+        }
+    }
+
     const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('status') === 'success') {
-        Swal.fire({ icon: 'success', title: 'บันทึกสำเร็จ', text: 'ระบบอัปเดตสต็อกเรียบร้อยแล้ว', timer: 2000, showConfirmButton: false })
-        .then(()=>window.history.replaceState(null,null,window.location.pathname));
+    if(urlParams.get('status') === 'success') {
+        Swal.fire({ icon: 'success', title: 'บันทึกผลตรวจสอบสำเร็จ!', text: 'ระบบอัปเดตสต็อกเรียบร้อยแล้ว', timer: 2000, showConfirmButton: false })
+        .then(() => window.history.replaceState(null, null, window.location.pathname));
     }
 </script>
 </body>
