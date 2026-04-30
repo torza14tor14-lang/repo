@@ -9,264 +9,202 @@ if (empty($_SESSION['userid'])) {
 
 $user_role = $_SESSION['role'] ?? '';
 $user_dept = $_SESSION['dept'] ?? '';
-$fullname = $_SESSION['fullname'] ?? 'พนักงานคลังสินค้า';
+$fullname = $_SESSION['fullname'] ?? 'พนักงานคลัง';
 
-$allowed_depts = ['แผนกคลังสินค้า 1', 'แผนกคลังสินค้า 2', 'ฝ่ายจัดซื้อ'];
-if ($user_role !== 'ADMIN' && $user_role !== 'MANAGER' && !in_array($user_dept, $allowed_depts)) { 
-    echo "<script>alert('เฉพาะฝ่ายคลังสินค้าและผู้บริหารเท่านั้น'); window.location='../index.php';</script>"; exit(); 
+$group_wh = ['แผนกคลังสินค้า 1', 'แผนกคลังสินค้า 2'];
+$group_pur = ['ฝ่ายจัดซื้อ'];
+if ($user_role !== 'ADMIN' && $user_role !== 'MANAGER' && !in_array($user_dept, $group_wh) && !in_array($user_dept, $group_pur)) { 
+    echo "<script>alert('เฉพาะแผนกคลังสินค้าหรือฝ่ายจัดซื้อเท่านั้น'); window.location='../index.php';</script>"; 
+    exit(); 
 }
 
-// 🚀 ปลดล็อคคอลัมน์ status ให้สามารถรับคำศัพท์ใหม่ๆ ได้
-mysqli_query($conn, "ALTER TABLE `purchase_orders` MODIFY `status` VARCHAR(50) DEFAULT 'Pending'");
+// 🚀 [Auto-Update DB] เพิ่มคอลัมน์ status ให้รายการย่อย (po_items) เพื่อแยกรับทีละรายการได้
+$check_pi_status = mysqli_query($conn, "SHOW COLUMNS FROM `po_items` LIKE 'status'");
+if(mysqli_num_rows($check_pi_status) == 0) {
+    mysqli_query($conn, "ALTER TABLE `po_items` ADD `status` VARCHAR(50) DEFAULT 'Pending' AFTER `unit_price`");
+    mysqli_query($conn, "UPDATE `po_items` SET `status` = 'Pending'"); // อัปเดตของเก่าให้เป็น Pending
+}
 
-// 🚀 ซ่อมแซมข้อมูลที่อาจจะเคยบันทึกพังเป็นค่าว่างไปก่อนหน้านี้
-mysqli_query($conn, "UPDATE `purchase_orders` SET `status` = 'Received_Pending_QA' WHERE `status` = ''");
+// 🚀 [Auto-Update DB] เพิ่มคอลัมน์ wh_id ให้ inventory_lots (ถ้ายังไม่มี)
+$check_wh_col = mysqli_query($conn, "SHOW COLUMNS FROM `inventory_lots` LIKE 'wh_id'");
+if(mysqli_num_rows($check_wh_col) == 0) {
+    mysqli_query($conn, "ALTER TABLE `inventory_lots` ADD `wh_id` INT(11) NOT NULL DEFAULT 0 AFTER `product_id`");
+}
 
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['receive_po'])) {
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirm_receive'])) {
+    $po_item_id = (int)$_POST['po_item_id']; // 🚀 ไอดีของรายการย่อย
     $po_id = (int)$_POST['po_id'];
-    $invoice_ref = mysqli_real_escape_string($conn, $_POST['invoice_ref']);
+    $product_id = (int)$_POST['product_id'];
+    $receive_qty = (float)$_POST['receive_qty'];
+    $wh_id = (int)$_POST['wh_id']; 
+    $scale_no = mysqli_real_escape_string($conn, $_POST['scale_no']);
     $remark = mysqli_real_escape_string($conn, $_POST['remark']);
 
-    $q_items = mysqli_query($conn, "SELECT * FROM po_items WHERE po_id = $po_id");
-    $receive_success = true;
-    $po_needs_qa = false; // ตัวแปรเช็คว่าในบิลนี้มี "วัตถุดิบ" ที่ต้องผ่าน QA ไหม
-    
-    if ($q_items && mysqli_num_rows($q_items) > 0) {
-        while ($item = mysqli_fetch_assoc($q_items)) {
-            $product_id = (int)$item['item_id'];
-            $qty = (float)$item['quantity'];
+    if ($receive_qty > 0 && $wh_id > 0) {
+        
+        // 1. 🚀 อัปเดตสถานะ "เฉพาะรายการนี้" ว่ารับแล้ว
+        mysqli_query($conn, "UPDATE po_items SET status = 'Received' WHERE id = $po_item_id");
 
-            // 🚀 ดึงประเภทสินค้า (p_type) มาเพื่อคัดแยกทางด่วน
-            $q_prod = mysqli_query($conn, "SELECT p_name, p_type, shelf_life_days FROM products WHERE id = $product_id");
-            $prod = mysqli_fetch_assoc($q_prod);
-            $p_type = $prod['p_type'] ?? '';
-            $shelf_life = (int)($prod['shelf_life_days'] ?? 0);
-            
-            // สร้างเลข LOT ให้กับสินค้าที่เข้ามา
-            $lot_no = "REC-" . date('Ymd') . "-" . str_pad($po_id, 4, "0", STR_PAD_LEFT) . "-" . $product_id;
-            $mfg = date('Y-m-d');
-            $exp = ($shelf_life > 0) ? date('Y-m-d', strtotime("+$shelf_life days")) : '2099-12-31';
-
-            // 🚀 ตรรกะคัดแยกประเภทสินค้า (Bypass Logic)
-            if ($p_type === 'RAW') {
-                // 🛑 กรณี 1: วัตถุดิบ (RAW) -> ต้องเข้าโซนกักกันรอ QA ตรวจก่อน
-                $sql_lot = "INSERT INTO inventory_lots (product_id, lot_no, mfg_date, exp_date, qty, status) 
-                            VALUES ($product_id, '$lot_no', '$mfg', '$exp', $qty, 'Pending_QA')";
-                if (!mysqli_query($conn, $sql_lot)) { $receive_success = false; }
-                
-                $po_needs_qa = true; // ล็อคเป้าว่าบิลนี้ยังไงก็ต้องรอ QA เคาะ
-                
-            } else {
-                // 🟢 กรณี 2: ของใช้/อะไหล่ (SPARE, SUPPLY, ASSET ฯลฯ) -> ทะลุเข้าสต็อก Active เลย
-                $sql_lot = "INSERT INTO inventory_lots (product_id, lot_no, mfg_date, exp_date, qty, status) 
-                            VALUES ($product_id, '$lot_no', '$mfg', '$exp', $qty, 'Active')";
-                
-                if (mysqli_query($conn, $sql_lot)) {
-                    // ปรับยอดสต็อกหลัก (products) ให้เบิกได้ทันที
-                    mysqli_query($conn, "UPDATE products SET p_qty = p_qty + $qty WHERE id = $product_id");
-                    
-                    // บันทึก Log ว่าของชิ้นนี้ไม่ต้องผ่าน QA
-                    mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, reference, action_by) 
-                                         VALUES ($product_id, 'IN', $qty, 'รับเข้าคลัง: ของใช้/อะไหล่ PO-$po_id (Bypass QA)', '$fullname')");
-                } else {
-                    $receive_success = false;
-                }
-            }
+        // 2. 🚀 ตรวจสอบว่าใน PO นี้ ยังมีรายการอื่นที่รอรับอยู่อีกไหม?
+        $q_check_remaining = mysqli_query($conn, "SELECT COUNT(*) as c FROM po_items WHERE po_id = $po_id AND status = 'Pending'");
+        $pending_count = mysqli_fetch_assoc($q_check_remaining)['c'];
+        
+        if ($pending_count == 0) {
+            // ถ้าไม่มีของรอรับแล้ว (รับครบทุกรายการ) ค่อยเปลี่ยนสถานะ PO ทั้งใบเป็น Delivered
+            mysqli_query($conn, "UPDATE purchase_orders SET status = 'Delivered' WHERE po_id = $po_id");
         }
 
-        if ($receive_success) {
-            // 🚀 อัปเดตสถานะบิล PO ตามประเภทของที่อยู่ข้างใน
-            $final_status = $po_needs_qa ? 'Received_Pending_QA' : 'Delivered';
-            mysqli_query($conn, "UPDATE purchase_orders SET status = '$final_status' WHERE po_id = $po_id");
+        // เพิ่มสต็อกเข้า "คลัง Hold"
+        mysqli_query($conn, "INSERT INTO stock_balances (product_id, wh_id, qty) 
+                             VALUES ($product_id, $wh_id, $receive_qty) 
+                             ON DUPLICATE KEY UPDATE qty = qty + $receive_qty");
 
-            // 🚀 บันทึกประวัติ Log ลงระบบ
-            if(function_exists('log_event')) {
-                $log_msg = $po_needs_qa ? "รับวัตถุดิบเข้าลาน PO-$po_id (ส่งรอกักกัน QA)" : "รับของใช้/อะไหล่ PO-$po_id (ผ่านเข้าสต็อกสำเร็จ)";
-                log_event($conn, 'UPDATE', 'purchase_orders', $log_msg);
-            }
+        $lot_no = "REC-" . date('Ymd') . "-" . $po_id . "-" . $po_item_id; // เติมไอดีให้ LOT ไม่ซ้ำกัน
+        
+        // สร้าง LOT เก็บลงคลัง Hold
+        mysqli_query($conn, "INSERT INTO inventory_lots (product_id, wh_id, lot_no, qty, mfg_date, status) 
+                             VALUES ($product_id, $wh_id, '$lot_no', $receive_qty, CURDATE(), 'Pending_QA')");
 
-            // แจ้งเตือน LINE โดยแยกตามประเภท
-            include_once '../line_api.php';
-            $po_info = mysqli_fetch_assoc(mysqli_query($conn, "SELECT supplier_name FROM purchase_orders WHERE po_id = $po_id"));
-            $msg = "🚛 [คลังสินค้า] รับสินค้าลงลาน/เข้าคลังเรียบร้อย\n\n";
-            $msg .= "🔖 อ้างอิง PO ID: PO-" . str_pad($po_id, 5, '0', STR_PAD_LEFT) . "\n";
-            $msg .= "🏢 จากซัพพลายเออร์: " . ($po_info['supplier_name'] ?? 'ไม่ระบุ') . "\n";
-            $msg .= "📄 เลขที่บิล/ใบส่งของ: " . $invoice_ref . "\n\n";
-            
-            if ($po_needs_qa) {
-                $msg .= "⚠️ สถานะ: มีวัตถุดิบกักกันรอตรวจสอบคุณภาพ\n";
-                $msg .= "👉 ฝ่าย QA โปรดเข้าตรวจสอบก่อนอนุมัติให้ฝ่ายผลิตใช้งานครับ";
-            } else {
-                $msg .= "✅ สถานะ: ของใช้/อะไหล่ นำเข้าสต็อกคลังสำเร็จ\n";
-                $msg .= "👉 พนักงานสามารถดำเนินการเบิกไปใช้งานได้ทันทีครับ (ไม่ต้องผ่าน QA)";
-            }
-            
-            if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
+        $ref_msg = "รับของจาก PO #$po_id (ตาชั่ง: $scale_no) รอกักกัน QA";
+        mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, to_wh_id, reference, action_by) 
+                             VALUES ($product_id, 'IN', $receive_qty, $wh_id, '$ref_msg', '$fullname')");
 
-            header("Location: receive_po.php?status=success"); exit;
-        }
-    } else {
-        header("Location: receive_po.php?status=error_no_items"); exit;
+        $p_name = mysqli_fetch_assoc(mysqli_query($conn, "SELECT p_name FROM products WHERE id = $product_id"))['p_name'];
+        $wh_name = mysqli_fetch_assoc(mysqli_query($conn, "SELECT wh_name FROM warehouses WHERE wh_id = $wh_id"))['wh_name'];
+        
+        include_once '../line_api.php';
+        $msg = "🚚 [คลังรับของเข้า] เรียบร้อยแล้ว\n\n📦 สินค้า: $p_name\n⚖️ ปริมาณ: " . number_format($receive_qty, 2) . "\n📥 เก็บไว้ที่: $wh_name\n🎫 ใบตาชั่ง: $scale_no\n\n👉 ฝ่าย QA โปรดเข้าตรวจสอบคุณภาพด้วยครับ";
+        if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
+
+        header("Location: receive_po.php?status=success"); exit();
     }
 }
+
+// 🚀 ดึงเฉพาะ "รายการย่อย" (po_items) ที่มีสถานะ Pending
+$sql_po = "SELECT po.po_id, po.supplier_name, po.created_at, 
+                  pi.id as po_item_id, pi.quantity as qty, 
+                  p.p_name, p.p_unit, p.id as p_id 
+           FROM purchase_orders po 
+           JOIN po_items pi ON po.po_id = pi.po_id 
+           JOIN products p ON pi.item_id = p.id
+           WHERE po.status IN ('Manager_Approved', 'Approved') AND pi.status = 'Pending' 
+           ORDER BY po.po_id DESC, pi.id ASC";
+$res_po = mysqli_query($conn, $sql_po);
+
+$res_wh = mysqli_query($conn, "SELECT * FROM warehouses WHERE wh_type = 'Hold' ORDER BY plant ASC, wh_name ASC");
 
 include '../sidebar.php';
 ?>
 
-<!DOCTYPE html>
-<html lang="th">
-<head>
-    <meta charset="UTF-8">
-    <title>Top Feed Mills | รับสินค้าเข้าคลัง (GRN)</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    <style>
-        .wrapper { font-family: 'Sarabun', sans-serif; animation: fadeIn 0.5s ease-in-out; }
-        .container-stacked { display: flex; flex-direction: column; gap: 25px; width: 100%; }
-        .card { background: #ffffff; padding: 25px 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.03); border: 1px solid #f0f0f0; }
-        h3 { color: #2c3e50; margin-top: 0; margin-bottom: 20px; font-weight: 600; border-bottom: 2px solid #f1f2f6; padding-bottom: 12px; display: flex; align-items: center; gap: 10px; }
-        .form-group { text-align: left; margin-bottom: 15px;}
-        label { display: block; margin-bottom: 8px; font-weight: 600; color: #4a5568; font-size: 0.9rem; }
-        input, select, textarea { width: 100%; padding: 10px 15px; border: 1.5px solid #e2e8f0; border-radius: 8px; font-family: 'Sarabun'; font-size: 1rem; box-sizing: border-box; }
-        .btn-action { background: linear-gradient(135deg, #1cc88a 0%, #13855c 100%); color: white; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.3s; display: inline-flex; align-items: center; gap: 8px; font-family: 'Sarabun'; }
-        .table-responsive { overflow-x: auto; width: 100%; border-radius: 10px; }
-        table { width: 100%; border-collapse: separate; border-spacing: 0; min-width: 900px; }
-        th, td { padding: 15px; border-bottom: 1px solid #f0f0f0; text-align: left; vertical-align: middle; }
-        th { background: #f8f9fa; color: #6c757d; font-weight: bold; font-size: 0.85rem; text-transform: uppercase; white-space: nowrap; }
-        .badge-status { padding: 5px 12px; border-radius: 50px; font-size: 12px; font-weight: bold; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
-        .st-approved { background: #cce5ff; color: #004085; border: 1px solid #b8daff; }
-        .st-delivered { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .st-wait { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-        .st-rejected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; }
-        .modal-content { background: white; border-radius: 16px; width: 90%; max-width: 600px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: pop 0.3s ease; }
-        @keyframes pop { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-        .modal-header { padding: 20px; border-bottom: 1px solid #eaecf4; display: flex; justify-content: space-between; align-items: center; background: #f8f9fc; border-radius: 16px 16px 0 0;}
-        .modal-close { cursor: pointer; font-size: 24px; color: #858796; }
-        .modal-body { padding: 25px; }
-        .info-box { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; color: #0d47a1; font-size: 15px;}
-    </style>
-</head>
-<body>
+<title>รับสินค้าเข้าคลัง (GRN) | Top Feed Mills</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+<style>
+    :root { --primary: #3b82f6; --success: #10b981; --warning: #f59e0b; --bg: #f8fafc; }
+    body { font-family: 'Sarabun', sans-serif; background: var(--bg); }
+    .content-padding { padding: 30px; max-width: 1400px; margin: auto; }
+    .po-card { background: white; border-radius: 15px; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; border-left: 5px solid var(--primary); display: flex; justify-content: space-between; align-items: center; transition: 0.3s; flex-wrap: wrap; gap:15px;}
+    .po-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+    .btn-receive { background: var(--success); color: white; border: none; padding: 12px 20px; border-radius: 10px; font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content:center; gap: 8px; font-family:'Sarabun';}
+    
+    .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+    .modal-content { background: white; border-radius: 20px; width: 90%; max-width: 550px; padding: 35px; box-shadow: 0 20px 40px rgba(0,0,0,0.2); animation: pop 0.3s ease; }
+    @keyframes pop { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    
+    .form-label { display: block; font-weight: 800; margin-bottom: 8px; color: #334155; font-size: 14px; }
+    .form-control { width: 100%; padding: 12px; border: 1.5px solid #e2e8f0; border-radius: 10px; font-family: 'Sarabun'; margin-bottom: 20px; box-sizing: border-box; }
+    .form-control:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+</style>
 
 <div class="content-padding">
-    <div class="wrapper">
-        <div class="container-stacked">
+    <div style="margin-bottom: 30px;">
+        <h2 style="margin:0; color:#1e293b; font-weight:800;"><i class="fa-solid fa-truck-ramp-box" style="color:var(--primary);"></i> รับวัตถุดิบเข้าคลัง (Goods Receipt)</h2>
+        <p style="color:#64748b;">รับวัตถุดิบลงคลังกักกัน (Hold) เพื่อรอให้ QA มาตรวจสอบ (สามารถทยอยรับทีละรายการได้)</p>
+    </div>
 
-            <div class="card" style="border-top: 4px solid #f6c23e;">
-                <h3><i class="fa-solid fa-truck-ramp-box" style="color: #f6c23e;"></i> รายการสั่งซื้อที่รอรับสินค้าเข้าลาน/เข้าคลัง (GRN)</h3>
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>PO ID / เลขอ้างอิง</th>
-                                <th>ซัพพลายเออร์ (ผู้ขาย)</th>
-                                <th>กำหนดส่งของ</th>
-                                <th>จำนวนรายการ</th>
-                                <th>สถานะ</th>
-                                <th style="text-align:right;">ดำเนินการ</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php
-                            $sql_pending = "SELECT po.*, (SELECT COUNT(*) FROM po_items WHERE po_id = po.po_id) as total_items 
-                                            FROM purchase_orders po 
-                                            WHERE po.status IN ('Approved', 'Manager_Approved')
-                                            ORDER BY po.expected_delivery_date ASC";
-                            $res_pending = mysqli_query($conn, $sql_pending);
-                            
-                            if ($res_pending && mysqli_num_rows($res_pending) > 0) {
-                                while($row = mysqli_fetch_assoc($res_pending)) {
-                            ?>
-                                <tr>
-                                    <td><strong style="color:#4e73df; font-size: 1.1rem;">PO-<?= str_pad($row['po_id'], 5, '0', STR_PAD_LEFT) ?></strong></td>
-                                    <td><strong style="color:#2c3e50;"><i class="fa-solid fa-building"></i> <?= htmlspecialchars($row['supplier_name']) ?></strong></td>
-                                    <td><strong style="color:#e74a3b;"><?= date('d/m/Y', strtotime($row['expected_delivery_date'])) ?></strong></td>
-                                    <td><span style="background:#e2e8f0; padding:4px 10px; border-radius:50px; font-weight:bold; color:#333;"><?= $row['total_items'] ?> รายการ</span></td>
-                                    <td><span class="badge-status st-approved"><i class="fa-solid fa-plane-arrival"></i> รถกำลังมาส่ง</span></td>
-                                    <td style="text-align:right;">
-                                        <button type="button" class="btn-action" 
-                                            data-id="<?= $row['po_id'] ?>" 
-                                            data-supplier="<?= htmlspecialchars($row['supplier_name']) ?>" 
-                                            data-items="<?= $row['total_items'] ?>" 
-                                            onclick="openReceiveModal(this)">
-                                            <i class="fa-solid fa-box-open"></i> รับสินค้าเข้าคลัง
-                                        </button>
-                                    </td>
-                                </tr>
-                            <?php } } else { echo "<tr><td colspan='6' style='text-align:center; padding:50px; color:#888;'>ไม่มีรายการสั่งซื้อที่รอรับของ</td></tr>"; } ?>
-                        </tbody>
-                    </table>
+    <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(600px, 1fr)); gap:20px;">
+        <?php if ($res_po && mysqli_num_rows($res_po) > 0): ?>
+            <?php while($row = mysqli_fetch_assoc($res_po)): ?>
+                <div class="po-card">
+                    <div>
+                        <span style="background:#dbeafe; color:#1e40af; padding:4px 12px; border-radius:50px; font-size:12px; font-weight:bold;">PO #<?= str_pad($row['po_id'], 5, "0", STR_PAD_LEFT) ?></span>
+                        <h3 style="margin: 10px 0 5px 0; color:#1e293b;"><?= htmlspecialchars($row['p_name']) ?></h3>
+                        <p style="margin:0; color:#64748b; font-size:14px;">
+                            <i class="fa-solid fa-store"></i> ผู้ขาย: <?= htmlspecialchars($row['supplier_name']) ?> | 
+                            <i class="fa-solid fa-calendar"></i> สั่งเมื่อ: <?= date('d/m/Y', strtotime($row['created_at'])) ?>
+                        </p>
+                    </div>
+                    <div style="text-align: right; min-width: 150px;">
+                        <div style="font-size: 22px; font-weight: 800; color: var(--primary); margin-bottom: 10px;">
+                            <?= number_format($row['qty'], 2) ?> <small style="font-size: 14px; color:#64748b;"><?= $row['p_unit'] ?></small>
+                        </div>
+                        <button class="btn-receive" onclick="openReceiveModal(<?= $row['po_item_id'] ?>, <?= $row['po_id'] ?>, <?= $row['p_id'] ?>, '<?= htmlspecialchars($row['p_name']) ?>', <?= $row['qty'] ?>, '<?= $row['p_unit'] ?>')">
+                            <i class="fa-solid fa-file-import"></i> บันทึกรับลงคลังกักกัน
+                        </button>
+                    </div>
                 </div>
+            <?php endwhile; ?>
+        <?php else: ?>
+            <div style="grid-column: 1 / -1; text-align:center; padding:100px; background:white; border-radius:20px; color:#94a3b8; border: 1px dashed #cbd5e1;">
+                <i class="fa-solid fa-truck-clock fa-4x" style="margin-bottom:20px; opacity:0.3;"></i><br>
+                <h3 style="margin:0;">ไม่มีรายการที่รอรับเข้าในขณะนี้</h3>
             </div>
-
-            <div class="card" style="border-top: 4px solid #1cc88a;">
-                <h3><i class="fa-solid fa-clock-rotate-left" style="color: #1cc88a;"></i> ประวัติการรับสินค้าเข้าคลังและผลตรวจ QA</h3>
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>PO ID</th>
-                                <th>ซัพพลายเออร์</th>
-                                <th>สถานะปัจจุบัน</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php
-                            $sql_history = "SELECT * FROM purchase_orders WHERE status IN ('Received_Pending_QA', 'Completed', 'QA_Rejected', 'Delivered') ORDER BY po_id DESC LIMIT 30";
-                            $res_history = mysqli_query($conn, $sql_history);
-                            
-                            if ($res_history && mysqli_num_rows($res_history) > 0) {
-                                while($row = mysqli_fetch_assoc($res_history)) {
-                                    if ($row['status'] == 'Received_Pending_QA') {
-                                        $badge = "<span class='badge-status st-wait'><i class='fa-solid fa-microscope'></i> กักกัน (รอ QA ตรวจวัตถุดิบ)</span>";
-                                    } elseif ($row['status'] == 'QA_Rejected') {
-                                        $badge = "<span class='badge-status st-rejected'><i class='fa-solid fa-ban'></i> QA ตีกลับ (ของเสีย)</span>";
-                                    } else {
-                                        $badge = "<span class='badge-status st-delivered'><i class='fa-solid fa-check-double'></i> ของเข้าคลังสมบูรณ์</span>";
-                                    }
-                            ?>
-                                <tr>
-                                    <td><strong style="color:#4e73df;">PO-<?= str_pad($row['po_id'], 5, '0', STR_PAD_LEFT) ?></strong></td>
-                                    <td><strong style="color:#2c3e50;"><?= htmlspecialchars($row['supplier_name']) ?></strong></td>
-                                    <td><?= $badge ?></td>
-                                </tr>
-                            <?php } } else { echo "<tr><td colspan='3' style='text-align:center; padding:30px; color:#888;'>ยังไม่มีประวัติการรับสินค้า</td></tr>"; } ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-        </div>
+        <?php endif; ?>
     </div>
 </div>
 
 <div id="receiveModal" class="modal-overlay">
     <div class="modal-content">
-        <div class="modal-header">
-            <h3 style="color:#4e73df; margin:0;"><i class="fa-solid fa-dolly"></i> ยืนยันรับสินค้าเข้าคลัง</h3>
-            <div class="modal-close" onclick="closeReceiveModal()"><i class="fa-solid fa-xmark"></i></div>
-        </div>
-        <form method="POST">
-            <div class="modal-body">
-                <input type="hidden" name="po_id" id="mod_po_id">
-                <div class="info-box">
-                    <i class="fa-solid fa-truck"></i> <strong>รับของจาก:</strong> <span id="mod_supplier"></span><br>
-                    <i class="fa-solid fa-list-check" style="margin-top: 8px;"></i> <strong>จำนวน:</strong> <span id="mod_items" style="color: #e74a3b;"></span> รายการ
+        <h3 style="margin-top:0; color:#1e293b; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; margin-bottom: 25px;">
+            <i class="fa-solid fa-shield-halved" style="color:var(--warning);"></i> ยืนยันรับของลงคลังกักกัน (Hold)
+        </h3>
+        <form method="POST" onsubmit="return confirm('ยืนยันรับสินค้านี้เข้าคลัง Hold?');">
+            <input type="hidden" name="po_item_id" id="m_po_item_id">
+            <input type="hidden" name="po_id" id="m_po_id">
+            <input type="hidden" name="product_id" id="m_p_id">
+
+            <div style="background: #f8fafc; padding: 15px; border-radius: 12px; margin-bottom: 20px; border: 1px dashed #cbd5e1;">
+                <span style="font-size: 13px; color:#64748b;">วัตถุดิบที่จะรับเข้า:</span><br>
+                <strong id="m_p_name" style="font-size: 18px; color: #1e293b;">-</strong>
+            </div>
+
+            <div style="display:flex; gap:15px; flex-wrap:wrap;">
+                <div style="flex:1; min-width:200px;">
+                    <label class="form-label">เลขที่ใบตาชั่ง (Scale Ticket) <span style="color:red;">*</span></label>
+                    <input type="text" name="scale_no" class="form-control" placeholder="เช่น TK-64001" required>
                 </div>
-                <div style="background: #fff5f5; padding: 12px; border-radius: 8px; border: 1px dashed #f5c6cb; color: #c0392b; font-size: 13px; margin-bottom: 15px;">
-                    <i class="fa-solid fa-circle-info"></i> ระบบจะคัดแยกอัตโนมัติ: ถ้าเป็น <b>"วัตถุดิบ"</b> จะถูกกักกันส่งให้ QA ตรวจ แต่ถ้าเป็น <b>"อะไหล่/ของใช้"</b> จะตัดเข้าคลังให้เบิกใช้งานได้ทันที
+                <div style="flex:1; min-width:200px;">
+                    <label class="form-label">น้ำหนักรับจริง (สุทธิ) <span style="color:red;">*</span></label>
+                    <input type="number" step="0.001" name="receive_qty" id="m_qty" class="form-control" required style="font-weight:bold; color:var(--primary);">
                 </div>
-                <div class="form-group">
-                    <label>เลขที่ใบส่งของ (Invoice Ref.) <span style="color:red;">*</span></label>
-                    <input type="text" name="invoice_ref" required>
-                </div>
-                <div class="form-group">
-                    <label>หมายเหตุ</label>
-                    <textarea name="remark" rows="2"></textarea>
-                </div>
-                <button type="submit" name="receive_po" class="btn-action" style="width:100%; justify-content:center; font-size: 16px; padding: 12px;">
-                    <i class="fa-solid fa-check-double"></i> ยืนยันรับของ
+            </div>
+
+            <label class="form-label" style="color:var(--warning);"><i class="fa-solid fa-warehouse"></i> เลือกคลังกักกันรับของ (Hold) <span style="color:red;">*</span></label>
+            <select name="wh_id" class="form-control" required style="font-weight:bold; border-color:#fcd34d;">
+                <option value="">-- เลือกคลัง Hold --</option>
+                <?php 
+                if ($res_wh) {
+                    mysqli_data_seek($res_wh, 0);
+                    while($wh = mysqli_fetch_assoc($res_wh)): 
+                ?>
+                    <option value="<?= $wh['wh_id'] ?>">
+                        [<?= $wh['plant'] ?>] <?= $wh['wh_name'] ?>
+                    </option>
+                <?php 
+                    endwhile; 
+                }
+                ?>
+            </select>
+            <small style="color:#d97706; display:block; margin-top:-15px; margin-bottom:20px; font-weight:bold;">* ระบบจำกัดให้รับลงได้เฉพาะคลังประเภท Hold เท่านั้น</small>
+
+            <label class="form-label">หมายเหตุเพิ่มเติม</label>
+            <textarea name="remark" class="form-control" rows="2" placeholder="เช่น กระสอบมีรอยฉีกขาด 2 ใบ..."></textarea>
+
+            <div style="display:flex; gap:10px; margin-top:10px;">
+                <button type="button" class="btn-receive" style="background:#e2e8f0; color:#475569; flex:1; justify-content:center;" onclick="closeModal()">ยกเลิก</button>
+                <button type="submit" name="confirm_receive" class="btn-receive" style="flex:2; justify-content:center;">
+                    <i class="fa-solid fa-check-circle"></i> บันทึกรับของรอกักกัน
                 </button>
             </div>
         </form>
@@ -274,23 +212,20 @@ include '../sidebar.php';
 </div>
 
 <script>
-    function openReceiveModal(btn) {
-        document.getElementById('mod_po_id').value = btn.getAttribute('data-id');
-        document.getElementById('mod_supplier').innerText = btn.getAttribute('data-supplier');
-        document.getElementById('mod_items').innerText = btn.getAttribute('data-items');
+    // ส่ง po_item_id เข้าไปด้วย เพื่ออัปเดตสถานะทีละรายการ
+    function openReceiveModal(po_item_id, po_id, p_id, p_name, qty, unit) {
+        document.getElementById('m_po_item_id').value = po_item_id;
+        document.getElementById('m_po_id').value = po_id;
+        document.getElementById('m_p_id').value = p_id;
+        document.getElementById('m_p_name').innerText = p_name;
+        document.getElementById('m_qty').value = qty;
         document.getElementById('receiveModal').style.display = 'flex';
     }
-    function closeReceiveModal() { document.getElementById('receiveModal').style.display = 'none'; }
-    window.onclick = function(e) { if (e.target == document.getElementById('receiveModal')) closeReceiveModal(); }
+    function closeModal() { document.getElementById('receiveModal').style.display = 'none'; }
 
     const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('status') === 'success') {
-        Swal.fire({ icon: 'success', title: 'รับสินค้าสำเร็จ!', text: 'ระบบจัดเรียงและตัดสต็อกสินค้าเรียบร้อยแล้ว', timer: 3000, showConfirmButton: false })
-        .then(() => window.history.replaceState(null, null, window.location.pathname));
-    } else if (urlParams.get('status') === 'error_no_items') {
-        Swal.fire({ icon: 'error', title: 'เกิดข้อผิดพลาด', text: 'ไม่พบรายการสินค้าในใบสั่งซื้อนี้', timer: 3000, showConfirmButton: false })
-        .then(() => window.history.replaceState(null, null, window.location.pathname));
+    if(urlParams.get('status') === 'success') {
+        Swal.fire({ icon: 'success', title: 'รับของสำเร็จ!', text: 'วัตถุดิบเข้าไปรอกักกันให้ QA ตรวจแล้ว', timer: 2500, showConfirmButton: false })
+        .then(() => { window.history.replaceState(null, null, window.location.pathname); });
     }
 </script>
-</body>
-</html>

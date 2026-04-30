@@ -6,59 +6,72 @@ $user_dept = $_SESSION['dept'] ?? '';
 $is_logged_in = !empty($_SESSION['userid']);
 $current_page = basename($_SERVER['PHP_SELF']);
 
+// 🚀 1. อัปเดตรายชื่อกลุ่มแผนกให้ตรงตามโครงสร้างองค์กร (Multi-Plant / Office / Academic)
 $group_prod    = ['แผนกผลิต 1', 'แผนกผลิต 2', 'ผลิตอาหารสัตว์น้ำ', 'ฝ่ายงานวางแผน'];
 $group_wh      = ['แผนกคลังสินค้า 1', 'แผนกคลังสินค้า 2'];
 $group_pur     = ['ฝ่ายจัดซื้อ'];
 $group_qa      = ['แผนก QA', 'แผนก QC', 'ฝ่ายวิชาการ'];
 $group_mnt     = ['แผนกซ่อมบำรุง 1', 'แผนกซ่อมบำรุง 2', 'แผนกไฟฟ้า 1', 'แผนกไฟฟ้า 2', 'แผนก P&M - 1', 'แผนก P&M - 2'];
-$group_sales   = ['ฝ่ายขาย']; 
+$group_sales   = ['ฝ่ายขาย'];
 $group_finance = ['ฝ่ายบัญชี', 'ฝ่ายการเงิน', 'ฝ่ายสินเชื่อ', 'บัญชี - ท็อปธุรกิจ']; 
 $group_hr      = ['ฝ่าย HR'];
 $group_it      = ['แผนกคอมพิวเตอร์']; 
-$group_logistics = ['แผนกจัดส่ง', 'ฝ่ายโลจิสติกส์']; // 🚀 เพิ่มกลุ่มจัดส่ง
+$group_logistics = ['แผนกจัดส่ง', 'ฝ่ายโลจิสติกส์'];
 
+// ตัวแปรเก็บจำนวนแจ้งเตือน
 $badge_pr = 0; $badge_po = 0; $badge_po_receive = 0; $badge_stock = 0; 
 $badge_production = 0; $badge_qa_inbound = 0; $badge_qa_outbound = 0; 
 $badge_maintenance = 0; $badge_approve = 0; $badge_payment = 0; 
-$badge_ap = 0; $badge_delivery = 0; // 🚀 เพิ่มตัวแปรแจ้งเตือนจัดส่ง
+$badge_ap = 0; $badge_delivery = 0; 
 
+// 🚀 2. ดึงตัวเลขแจ้งเตือน (แยกตามสิทธิ์ที่ควรเห็น)
 if ($is_logged_in) {
     if ($user_role == 'ADMIN' || $user_role == 'MANAGER') {
         $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM purchase_requests WHERE status = 'Pending'");
         if($q) $badge_pr = mysqli_fetch_assoc($q)['c'];
     }
-    if ($user_role == 'ADMIN' || $user_dept == 'ฝ่ายจัดซื้อ' || $user_role == 'MANAGER') {
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_pur)) {
         $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM purchase_orders WHERE status = 'Pending'");
         if($q) $badge_po = mysqli_fetch_assoc($q)['c'];
     }
-    if ($user_role == 'ADMIN' || strpos($user_dept, 'คลังสินค้า') !== false) {
+    // GRN (คลังรับของ) ให้เห็นเฉพาะคลัง, จัดซื้อ และผู้บริหาร
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur)) {
         $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM purchase_orders WHERE status = 'Manager_Approved'");
         if($q) $badge_po_receive = mysqli_fetch_assoc($q)['c'];
     }
-    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur) || in_array($user_dept, $group_prod)) { 
-        $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM products WHERE p_qty <= p_min");
+    // แจ้งเตือนของใกล้หมด (ให้จัดซื้อ, คลัง, ผลิต, ฝ่ายขาย และผู้บริหารเห็น)
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur) || in_array($user_dept, $group_prod) || in_array($user_dept, $group_sales)) { 
+        $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM products p 
+                          LEFT JOIN (SELECT product_id, SUM(qty) as total FROM stock_balances GROUP BY product_id) sb 
+                          ON p.id = sb.product_id 
+                          WHERE IFNULL(sb.total, 0) <= p.p_min");
         if($q) $badge_stock = mysqli_fetch_assoc($q)['c']; 
     }
-    if ($user_role == 'ADMIN' || strpos($user_dept, 'ผลิต') !== false) {
-        $dept_filter = ($user_role === 'ADMIN') ? "" : "AND production_line = '$user_dept'";
+    // ผลิต
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_prod)) {
+        $dept_filter = ($user_role === 'ADMIN' || $user_role === 'MANAGER' || $user_dept === 'ฝ่ายงานวางแผน') ? "" : "AND production_line = '$user_dept'";
         $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM production_orders WHERE status = 'Pending' $dept_filter");
         if($q) $badge_production = mysqli_fetch_assoc($q)['c'];
     }
-    if ($user_role == 'ADMIN' || in_array($user_dept, $group_qa)) {
+    // QA
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_qa)) {
         $q_in = mysqli_query($conn, "SELECT COUNT(DISTINCT lot_no) as c FROM inventory_lots WHERE status = 'Pending_QA' AND qty > 0 AND lot_no LIKE 'REC-%'");
         if($q_in) $badge_qa_inbound = mysqli_fetch_assoc($q_in)['c'];
         
         $q_out = mysqli_query($conn, "SELECT COUNT(DISTINCT lot_no) as c FROM inventory_lots WHERE status = 'Pending_QA' AND qty > 0 AND lot_no NOT LIKE 'REC-%'");
         if($q_out) $badge_qa_outbound = mysqli_fetch_assoc($q_out)['c'];
     }
+    // ซ่อมบำรุง
     if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_mnt)) { 
         $q = mysqli_query($conn, "SELECT COUNT(*) as c FROM maintenance_requests WHERE status = 'Pending'");
         if($q) $badge_maintenance = mysqli_fetch_assoc($q)['c']; 
     }
-    if ($user_role == 'MANAGER' || $user_role == 'ADMIN' || $user_dept == 'ฝ่าย HR') {
+    // HR
+    if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_hr)) {
         $q_ot = mysqli_query($conn, "SELECT COUNT(*) as c FROM ot_records WHERE status = 'Pending'");
         if($q_ot) $badge_approve += mysqli_fetch_assoc($q_ot)['c'];
     }
+    // การเงิน / สินเชื่อ (AR/AP)
     if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_finance) || in_array($user_dept, $group_sales)) {
         $q_pay = mysqli_query($conn, "SELECT COUNT(*) as c FROM sales_orders WHERE payment_status IN ('Unpaid', 'Credit')");
         if($q_pay) $badge_payment = mysqli_fetch_assoc($q_pay)['c'];
@@ -70,7 +83,7 @@ if ($is_logged_in) {
             if($q_ap) $badge_ap = mysqli_fetch_assoc($q_ap)['c'];
         }
     }
-    // 🚀 เพิ่มเช็คบิลขายที่รอจัดส่ง (สำหรับโลจิสติกส์)
+    // จัดส่ง (Logistics)
     if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_logistics) || in_array($user_dept, $group_sales)) {
         $check_col_del = mysqli_query($conn, "SHOW COLUMNS FROM `sales_orders` LIKE 'delivery_status'");
         if ($check_col_del && mysqli_num_rows($check_col_del) > 0) {
@@ -263,9 +276,10 @@ $finance_total = $badge_payment + $badge_ap;
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </div>
                 <ul class="sub-menu">
-                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, ['ฝ่ายสินเชื่อ'])): ?>
+                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, ['ฝ่ายสินเชื่อ', 'ฝ่ายการเงิน'])): ?>
                         <li><a href="/my_system/sales/credit_approval.php" class="<?= ($current_page == 'credit_approval.php') ? 'active' : '' ?>"><i class="fa-solid fa-file-shield"></i> อนุมัติวงเงินเครดิตลูกค้า</a></li>
                     <?php endif; ?>
+                    
                     <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_sales)): ?>
                         <li><a href="/my_system/sales/manage_customers.php" class="<?= ($current_page == 'manage_customers.php') ? 'active' : '' ?>"><i class="fa-solid fa-address-book"></i> จัดการรายชื่อลูกค้า</a></li>
                         <li><a href="/my_system/sales/create_sales.php" class="<?= ($current_page == 'create_sales.php') ? 'active' : '' ?>"><i class="fa-solid fa-cart-arrow-down"></i> เปิดบิลขาย (ตัดสต็อก)</a></li>
@@ -311,7 +325,7 @@ $finance_total = $badge_payment + $badge_ap;
             </li>
         <?php endif; ?>
 
-        <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur) || in_array($user_dept, $group_prod)): ?>
+        <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur) || in_array($user_dept, $group_prod) || in_array($user_dept, $group_qa) || in_array($user_dept, $group_sales) || in_array($user_dept, $group_logistics)): ?>
             <li>
                 <div class="menu-toggle" onclick="toggleSubMenu(this)">
                     <span style="display:flex; align-items:center; gap:8px;">
@@ -321,20 +335,31 @@ $finance_total = $badge_payment + $badge_ap;
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </div>
                 <ul class="sub-menu">
+                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh) || in_array($user_dept, $group_pur)): ?>
                     <li>
                         <a href="/my_system/inventory/receive_po.php" class="<?= ($current_page == 'receive_po.php') ? 'active' : '' ?>">
                             <i class="fa-solid fa-truck-ramp-box"></i> รับของจาก PO (GRN)
                             <span id="badge-po-receive" class="nav-badge <?= ($badge_po_receive > 0) ? 'show' : '' ?>"><?= $badge_po_receive ?></span>
                         </a>
                     </li>
+                    <?php endif; ?>
+                    
                     <li>
                         <a href="/my_system/inventory/stock.php" class="<?= ($current_page == 'stock.php') ? 'active' : '' ?>">
                             <i class="fa-solid fa-cubes"></i> แผงควบคุมคลัง
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a href="/my_system/inventory/low_stock_report.php" class="<?= ($current_page == 'low_stock_report.php') ? 'active' : '' ?>">
+                            <i class="fa-solid fa-triangle-exclamation"></i> รายการของใกล้หมด
                             <span id="badge-stock" class="nav-badge <?= ($badge_stock > 0) ? 'show' : '' ?>" style="background:#f6c23e; color:#333;"><?= $badge_stock ?></span>
                         </a>
                     </li>
+
                     <li><a href="/my_system/inventory/history.php" class="<?= ($current_page == 'history.php') ? 'active' : '' ?>"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติความเคลื่อนไหว</a></li>
-                    <?php if ($user_role == 'ADMIN' || in_array($user_dept, $group_wh)): ?>
+                    
+                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_wh)): ?>
                         <li><a href="/my_system/inventory/add_product.php" class="<?= ($current_page == 'add_product.php') ? 'active' : '' ?>"><i class="fa-solid fa-folder-plus"></i> เพิ่มรายการวัตถุดิบ</a></li>
                         <li><a href="/my_system/inventory/stock_adjust.php" class="<?= ($current_page == 'stock_adjust.php') ? 'active' : '' ?>"><i class="fa-solid fa-sliders"></i> ปรับปรุงยอดสต็อก</a></li>
                         <li><a href="/my_system/inventory/scrap_product.php" class="<?= ($current_page == 'scrap_product.php') ? 'active' : '' ?>"><i class="fa-solid fa-dumpster-fire"></i> บันทึกตัดชำรุด (Scrap)</a></li>
@@ -434,17 +459,19 @@ $finance_total = $badge_payment + $badge_ap;
             </li>
         <?php endif; ?>
 
-        <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_it)): ?>
+        <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_it) || in_array($user_dept, $group_hr)): ?>
             <li>
                 <div class="menu-toggle" onclick="toggleSubMenu(this)">
                     <span>⚙️ จัดการระบบบริษัท</span>
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </div>
                 <ul class="sub-menu">
-                    <li><a href="/my_system/admin/report_center.php" class="<?= ($current_page == 'report_center.php') ? 'active' : '' ?>"><i class="fa-solid fa-chart-line"></i> ศูนย์รายงาน (Dashboard)</a></li>
-                    <li><a href="/my_system/admin/admin_news.php" class="<?= ($current_page == 'admin_news.php') ? 'active' : '' ?>"><i class="fa-solid fa-bullhorn"></i> จัดการประกาศข่าวสาร</a></li>
+                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_it)): ?>
+                        <li><a href="/my_system/admin/report_center.php" class="<?= ($current_page == 'report_center.php') ? 'active' : '' ?>"><i class="fa-solid fa-chart-line"></i> ศูนย์รายงาน (Dashboard)</a></li>
+                        <li><a href="/my_system/admin/admin_news.php" class="<?= ($current_page == 'admin_news.php') ? 'active' : '' ?>"><i class="fa-solid fa-bullhorn"></i> จัดการประกาศข่าวสาร</a></li>
+                    <?php endif; ?>
                     
-                    <?php if ($user_role == 'ADMIN' || in_array($user_dept, $group_hr)): ?>
+                    <?php if ($user_role == 'ADMIN' || $user_role == 'MANAGER' || in_array($user_dept, $group_hr)): ?>
                         <li><a href="/my_system/hr/manage_shifts.php" class="<?= ($current_page == 'manage_shifts.php') ? 'active' : '' ?>"><i class="fa-solid fa-business-time"></i> ตั้งค่ากะการทำงาน</a></li>
                         <li><a href="/my_system/hr/manage_holidays.php" class="<?= ($current_page == 'manage_holidays.php') ? 'active' : '' ?>"><i class="fa-solid fa-calendar-day"></i> ตั้งค่าวันหยุดบริษัท</a></li>
                     <?php endif; ?>
@@ -600,7 +627,7 @@ $finance_total = $badge_payment + $badge_ap;
             }
 
             if (data.badge_stock > 0) {
-                html += `<a href="/my_system/inventory/stock.php" class="noti-item">
+                html += `<a href="/my_system/inventory/low_stock_report.php" class="noti-item">
                             <div class="noti-icon" style="background:#e74a3b;"><i class="fa-solid fa-triangle-exclamation"></i></div>
                             <div class="noti-text"><strong>แจ้งเตือนสต็อกต่ำ!</strong><br>มีสินค้า <span style="color:#e74a3b; font-weight:bold;">${data.badge_stock}</span> รายการ ที่ต่ำกว่าจุดสั่งซื้อ/ผลิต</div>
                          </a>`;
@@ -663,7 +690,6 @@ $finance_total = $badge_payment + $badge_ap;
                 total += data.badge_ap;
             }
             
-            // 🚀 โชว์การแจ้งเตือนงานจัดส่ง (ถ้า API ดึงข้อมูลตัวนี้มาให้ด้วยในอนาคต)
             if (data.badge_delivery > 0) {
                 html += `<a href="/my_system/logistics/manage_delivery.php" class="noti-item">
                             <div class="noti-icon" style="background:#0ea5e9;"><i class="fa-solid fa-truck-fast"></i></div>
@@ -702,7 +728,7 @@ $finance_total = $badge_payment + $badge_ap;
                     updateBadges('badge-approve', data.badge_approve); 
                     updateBadges('badge-payment', data.badge_payment);
                     updateBadges('badge-ap', data.badge_ap); 
-                    updateBadges('badge-delivery', data.badge_delivery); // 🚀 เพิ่มสำหรับแจ้งเตือนจัดส่ง
+                    updateBadges('badge-delivery', data.badge_delivery); 
                     
                     updateBadges('badge-approve-main', data.badge_approve);
                     updateBadges('badge-sales-main', data.badge_payment + data.badge_ap); 
@@ -711,7 +737,7 @@ $finance_total = $badge_payment + $badge_ap;
                     updateBadges('badge-qa-main', data.badge_qa_inbound + data.badge_qa_outbound);
                     updateBadges('badge-pur-main', data.badge_po);
                     updateBadges('badge-mnt-main', data.badge_maintenance);
-                    updateBadges('badge-delivery-main', data.badge_delivery); // 🚀 โชว์ป้ายรวมหมวดจัดส่ง
+                    updateBadges('badge-delivery-main', data.badge_delivery); 
 
                     renderNotificationDropdown(data);
                 })

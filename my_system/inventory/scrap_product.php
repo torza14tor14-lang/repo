@@ -2,7 +2,6 @@
 session_start();
 include '../db.php';
 
-// ตรวจสอบการล็อกอิน
 if (empty($_SESSION['userid'])) { 
     echo "<script>alert('กรุณาเข้าสู่ระบบก่อนใช้งาน'); window.location='../login.php';</script>"; 
     exit(); 
@@ -10,297 +9,230 @@ if (empty($_SESSION['userid'])) {
 
 $user_role = $_SESSION['role'] ?? '';
 $user_dept = $_SESSION['dept'] ?? '';
-$fullname = $_SESSION['fullname'] ?? $_SESSION['username'];
+$fullname = $_SESSION['fullname'] ?? 'พนักงานคลัง';
 
-// สิทธิ์เข้าถึง (คลังสินค้า และ ผู้บริหาร)
-$allowed_depts = ['แผนกคลังสินค้า 1', 'แผนกคลังสินค้า 2'];
-if ($user_role !== 'ADMIN' && $user_role !== 'MANAGER' && !in_array($user_dept, $allowed_depts)) { 
-    echo "<script>alert('เฉพาะเจ้าหน้าที่คลังสินค้าและผู้บริหารเท่านั้น'); window.location='../index.php';</script>"; exit(); 
-}
-
-// 🚀 [Auto-Create Table] สร้างตารางเก็บประวัติของเสีย
-$check_table = mysqli_query($conn, "SHOW TABLES LIKE 'scrap_records'");
-if (mysqli_num_rows($check_table) == 0) {
-    mysqli_query($conn, "CREATE TABLE scrap_records (
-        id INT(11) AUTO_INCREMENT PRIMARY KEY,
-        product_id INT(11) NOT NULL,
-        lot_no VARCHAR(100) NOT NULL,
-        qty DECIMAL(15,2) NOT NULL,
-        reason TEXT NOT NULL,
-        reported_by VARCHAR(100) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;");
-}
-
-// 🚀 AJAX: ดึงรายการ LOT (แสดงเฉพาะ Lot ที่มีของเหลือ และ "ผ่าน QA แล้ว (Active)")
-if (isset($_POST['action']) && $_POST['action'] == 'get_lots') {
-    $p_id = (int)$_POST['product_id'];
-    $lots = [];
-    // 🐛 แก้ไข: เพิ่ม AND status = 'Active' เข้าไป
-    $q_lots = mysqli_query($conn, "SELECT lot_no, qty, exp_date FROM inventory_lots WHERE product_id = $p_id AND qty > 0 AND status = 'Active' ORDER BY exp_date ASC");
-    if($q_lots) {
-        while($row = mysqli_fetch_assoc($q_lots)) {
-            $row['exp_date_th'] = date('d/m/Y', strtotime($row['exp_date']));
-            $lots[] = $row;
-        }
-    }
-    echo json_encode($lots);
-    exit();
+// สิทธิ์เข้าถึง: ADMIN, MANAGER, และ แผนกคลังสินค้า
+if ($user_role !== 'ADMIN' && $user_role !== 'MANAGER' && strpos($user_dept, 'คลังสินค้า') === false) { 
+    echo "<script>alert('เฉพาะผู้ดูแลระบบและแผนกคลังสินค้าเท่านั้น'); window.location='stock.php';</script>"; 
+    exit(); 
 }
 
 $status = '';
 $error_msg = '';
 
-if (isset($_POST['save_scrap'])) {
-    $p_id = (int)$_POST['product_id'];
-    $lot_no = mysqli_real_escape_string($conn, $_POST['lot_no']);
-    $qty_scrap = (float)$_POST['qty'];
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['submit_scrap'])) {
+    list($product_id, $wh_id) = explode('|', $_POST['source_stock']);
+    $product_id = (int)$product_id;
+    $wh_id = (int)$wh_id;
+    
+    $qty = (float)$_POST['qty'];
     $reason = mysqli_real_escape_string($conn, $_POST['reason']);
+    $lot_no = mysqli_real_escape_string($conn, $_POST['lot_no'] ?? '-');
 
-    // ดึงเช็คเฉพาะสถานะ Active ด้วยเพื่อความปลอดภัย 2 ชั้น
-    $q_check = mysqli_query($conn, "SELECT qty FROM inventory_lots WHERE lot_no = '$lot_no' AND product_id = $p_id AND status = 'Active'");
-    if ($q_check && mysqli_num_rows($q_check) > 0) {
-        $lot_data = mysqli_fetch_assoc($q_check);
-        
-        if ($lot_data['qty'] >= $qty_scrap) {
-            
-            // 1. หักสต็อกออกจาก inventory_lots
-            mysqli_query($conn, "UPDATE inventory_lots SET qty = qty - $qty_scrap WHERE lot_no = '$lot_no'");
-            // 2. หักสต็อกรวมใน products
-            mysqli_query($conn, "UPDATE products SET p_qty = p_qty - $qty_scrap WHERE id = $p_id");
+    $q_stock = mysqli_query($conn, "SELECT qty FROM stock_balances WHERE product_id = $product_id AND wh_id = $wh_id");
+    $current_qty = ($q_stock && mysqli_num_rows($q_stock) > 0) ? (float)mysqli_fetch_assoc($q_stock)['qty'] : 0;
 
-            // 3. บันทึกลง stock_log
-            mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, reference, remark, action_by) 
-                                 VALUES ($p_id, 'OUT', $qty_scrap, 'ตัดชำรุด (Scrap) Lot: $lot_no', '$reason', '$fullname')");
-
-            // 4. บันทึกลง scrap_records
-            mysqli_query($conn, "INSERT INTO scrap_records (product_id, lot_no, qty, reason, reported_by) 
-                                 VALUES ($p_id, '$lot_no', $qty_scrap, '$reason', '$fullname')");
-
-            // ดึงชื่อสินค้าสำหรับแจ้งเตือนและ Log
-            $p_name = mysqli_fetch_assoc(mysqli_query($conn, "SELECT p_name FROM products WHERE id = $p_id"))['p_name'] ?? 'สินค้า';
-
-            // -----------------------------------------------------------------
-            // 🚀 บันทึกประวัติ Log ลงระบบ (System Logs)
-            // -----------------------------------------------------------------
-            if(function_exists('log_event')) {
-                log_event($conn, 'DELETE', 'inventory_lots', "ตัดชำรุดสินค้า FG $p_name (Lot: $lot_no) จำนวน $qty_scrap หน่วย | สาเหตุ: $reason");
-            }
-            // -----------------------------------------------------------------
-
-            // 5. แจ้งเตือน LINE
-            include_once '../line_api.php';
-            $msg = "🗑️ [คลังสินค้า] บันทึกตัดชำรุด/ของเสีย (Scrap)\n\n";
-            $msg .= "📦 สินค้า: $p_name\n🔖 Lot No: $lot_no\n➖ จำนวนที่ตัดทิ้ง: " . number_format($qty_scrap, 2) . " หน่วย\n💬 สาเหตุ: $reason\n\n";
-            $msg .= "ผู้ทำรายการ: $fullname\n👉 ฝ่ายบัญชีโปรดรับทราบเพื่อลงบันทึกเป็นค่าใช้จ่ายของเสียครับ";
-
-            if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
-
-            $status = 'success';
-        } else {
-            $status = 'error';
-            $error_msg = 'ยอดสต็อกใน LOT นี้มีไม่เพียงพอให้ตัดชำรุด (เหลือแค่ ' . number_format($lot_data['qty'], 2) . ')';
-        }
+    if ($qty <= 0) {
+        $error_msg = "จำนวนที่ตัดชำรุดต้องมากกว่า 0";
+    } elseif ($qty > $current_qty) {
+        $error_msg = "ยอดสินค้าในคลังที่ระบุมีไม่เพียงพอ! (มีแค่ $current_qty)";
     } else {
-        $status = 'error';
-        $error_msg = 'ไม่พบข้อมูล LOT นี้ในระบบ หรือ LOT นี้ยังไม่ผ่านการอนุมัติจาก QA';
+        mysqli_query($conn, "UPDATE stock_balances SET qty = qty - $qty WHERE product_id = $product_id AND wh_id = $wh_id");
+        mysqli_query($conn, "UPDATE products SET p_qty = p_qty - $qty WHERE id = $product_id");
+
+        mysqli_query($conn, "INSERT INTO scrap_records (product_id, lot_no, qty, reason, reported_by) 
+                             VALUES ($product_id, '$lot_no', $qty, '$reason', '$fullname')");
+
+        mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, from_wh_id, reference, action_by) 
+                             VALUES ($product_id, 'OUT', $qty, $wh_id, 'ตัดชำรุด/ของเสีย: $reason', '$fullname')");
+
+        if (function_exists('log_event')) {
+            $p_name = mysqli_fetch_assoc(mysqli_query($conn, "SELECT p_name FROM products WHERE id = $product_id"))['p_name'] ?? 'Unknown';
+            log_event($conn, 'INSERT', 'scrap_records', "ตัดชำรุด $p_name จำนวน $qty (จากคลัง ID: $wh_id) สาเหตุ: $reason");
+        }
+
+        include_once '../line_api.php';
+        $wh_name = mysqli_fetch_assoc(mysqli_query($conn, "SELECT wh_name FROM warehouses WHERE wh_id = $wh_id"))['wh_name'];
+        $msg = "🗑️ [แจ้งเตือนคลังสินค้า] บันทึกตัดชำรุด/ของเสีย\n\n📦 สินค้า: $p_name\n🏢 ตัดออกจาก: $wh_name\n📉 จำนวนที่ตัด: " . number_format($qty, 2) . "\nผู้ทำรายการ: $fullname\n💬 เหตุผล: $reason";
+        if(function_exists('sendLineMessage')) { sendLineMessage($msg); }
+
+        header("Location: scrap_product.php?status=success"); exit();
     }
 }
+
+$sql_source = "SELECT sb.product_id, sb.wh_id, sb.qty, p.p_name, p.p_unit, w.wh_name, w.plant 
+               FROM stock_balances sb
+               JOIN products p ON sb.product_id = p.id
+               JOIN warehouses w ON sb.wh_id = w.wh_id
+               WHERE sb.qty > 0
+               ORDER BY p.p_name ASC, w.plant ASC";
+$res_source = mysqli_query($conn, $sql_source);
+
+$res_history = mysqli_query($conn, "SELECT sr.*, p.p_name, p.p_unit FROM scrap_records sr JOIN products p ON sr.product_id = p.id ORDER BY sr.created_at DESC LIMIT 50");
 
 include '../sidebar.php';
 ?>
 
-<title>Top Feed Mills | บันทึกตัดชำรุดและของเสีย</title>
+<title>บันทึกตัดชำรุด (Scrap) | Top Feed Mills</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
 <style>
-    .wrapper { font-family: 'Sarabun', sans-serif; animation: fadeIn 0.4s ease; }
+    :root { --bg: #f8fafc; --card: #ffffff; --text-main: #1e293b; --text-muted: #64748b; }
+    body { font-family: 'Sarabun', sans-serif; background: var(--bg); }
+    .content-padding { padding: 30px; max-width: 1000px; margin: auto; } /* ปรับความกว้างให้กำลังดี */
     
-    .dashboard-container { display: flex; flex-direction: column; gap: 30px; }
-    
-    .adjust-card { background: white; padding: 30px 40px; border-radius: 16px; box-shadow: 0 5px 20px rgba(0,0,0,0.03); border-top: 5px solid #e74a3b; }
-    .history-card { background: white; padding: 30px 40px; border-radius: 16px; box-shadow: 0 5px 20px rgba(0,0,0,0.03); border-top: 5px solid #4e73df; }
-    
-    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    @media (max-width: 768px) { .form-grid { grid-template-columns: 1fr; } }
+    .scrap-card { background: var(--card); padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid var(--primary); margin-bottom:40px;}
+    .history-card { background: white; border-radius: 20px; padding: 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.03); }
     
     .form-group { margin-bottom: 20px; }
-    .form-label { display: block; font-weight: bold; color: #4a5568; margin-bottom: 8px; font-size: 14px;}
-    .form-control { width: 100%; padding: 12px 15px; border: 1.5px solid #e2e8f0; border-radius: 10px; font-family: 'Sarabun'; box-sizing: border-box; font-size:15px; transition: 0.3s;}
-    .form-control:focus { border-color: #e74a3b; outline:none; box-shadow: 0 0 0 3px rgba(231, 74, 59, 0.15); }
+    .form-label { display: block; font-weight: 800; color: var(--text-main); margin-bottom: 10px; font-size: 15px; }
+    .form-control { width: 100%; padding: 14px; border: 1.5px solid #e2e8f0; border-radius: 10px; font-family: 'Sarabun'; font-size: 15px; box-sizing: border-box; transition: 0.2s;}
+    .form-control:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgba(231, 74, 59, 0.15); }
     
-    .btn-save { background: linear-gradient(135deg, #e74a3b 0%, #be2617 100%); color: white; padding: 15px 30px; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; font-size: 16px; transition: 0.3s; font-family: 'Sarabun'; float: right; display: flex; align-items: center; gap: 8px; box-shadow: 0 4px 15px rgba(231, 74, 59, 0.3);}
-    .btn-save:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(231, 74, 59, 0.4); }
+    .select2-container--default .select2-selection--single { height: 50px; border: 1.5px solid #e2e8f0; border-radius: 10px; display: flex; align-items: center; }
+    .select2-container--default .select2-selection--single .select2-selection__rendered { padding-left: 15px; font-weight: bold; color: var(--text-main); font-size:15px;}
+    .select2-container--default .select2-selection--single .select2-selection__arrow { height: 48px; right: 10px; }
 
-    .select2-container--default .select2-selection--single { height: 48px; border: 1.5px solid #e2e8f0; border-radius: 10px; display: flex; align-items: center; font-family: 'Sarabun'; }
-    .select2-container--default .select2-selection--single .select2-selection__rendered { color: #4a5568; padding-left: 12px; font-size: 15px; }
-    .select2-container--default .select2-selection--single .select2-selection__arrow { height: 46px; right: 10px; }
+    .btn-submit { background: var(--primary); color: white; width: 100%; padding: 16px; border: none; border-radius: 10px; font-size: 18px; font-weight: 800; cursor: pointer; transition: 0.3s; font-family: 'Sarabun'; display:flex; justify-content:center; align-items:center; gap:10px;}
+    .btn-submit:hover { background: var(--primary-hover); transform: translateY(-2px); box-shadow: 0 5px 15px rgba(231, 74, 59, 0.3); }
 
-    table { width: 100%; border-collapse: collapse; min-width: 800px; }
-    .table-responsive { overflow-x: auto; width: 100%; border-radius: 8px; border: 1px solid #eaecf4;}
-    th { background: #f8f9fc; padding: 15px; text-align: left; color: #5a5c69; border-bottom: 2px solid #eaecf4; font-size: 13px; text-transform: uppercase; white-space: nowrap;}
-    td { padding: 15px; border-bottom: 1px solid #eaecf4; color: #333; font-size: 14px; vertical-align: top;}
-    tr:hover { background: #f8f9fc; }
-
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    table { width: 100%; border-collapse: collapse; min-width: 600px;}
+    th { text-align: left; padding: 15px; background: #f8fafc; color: var(--text-muted); font-size: 14px; font-weight: 800; border-bottom: 2px solid #e2e8f0; }
+    td { padding: 15px; border-bottom: 1px solid #f1f5f9; font-size: 15px; vertical-align:middle;}
+    tr:hover { background: #f8fafc; }
 </style>
 
 <div class="content-padding">
-    <div class="wrapper">
-        <h2 style="color: #2c3e50; margin-top:0; margin-bottom: 25px;"><i class="fa-solid fa-dumpster-fire" style="color: #e74a3b;"></i> ศูนย์จัดการของเสียและตัดชำรุด (Scrap Dashboard)</h2>
+    
+    <div style="margin-bottom: 30px;">
+        <h2 style="margin:0; color:var(--text-main); font-weight:800; font-size:26px;">
+            <i class="fa-solid fa-dumpster-fire" style="color:var(--primary);"></i> บันทึกตัดชำรุด / ของเสีย
+        </h2>
+        <p style="color:var(--text-muted); margin-top:5px;">ระบุคลัง/ไซโล ที่ต้องการนำสินค้าหรือวัตถุดิบที่ชำรุดออกจากระบบ</p>
+    </div>
 
-        <div class="dashboard-container">
+    <div class="scrap-card">
+        <?php if($error_msg): ?>
+            <div style="background: #fef2f2; color: #ef4444; padding: 15px; border-radius: 10px; margin-bottom: 25px; font-weight:bold; border:1px solid #fecaca;">
+                <i class="fa-solid fa-circle-exclamation"></i> <?= $error_msg ?>
+            </div>
+        <?php endif; ?>
+
+        <form method="POST" onsubmit="return confirm('ยืนยันการตัดยอดของเสีย? ระบบจะหักสต็อกออกจากโกดังที่คุณเลือกทันที');">
             
-            <div class="adjust-card">
-                <h3 style="margin-top:0; color:#e74a3b; font-size: 18px; border-bottom: 1px solid #f0f0f0; padding-bottom: 15px;"><i class="fa-solid fa-plus-circle"></i> บันทึกรายการตัดชำรุดใหม่</h3>
-                
-                <form method="POST">
-                    <div class="form-grid">
-                        <div>
-                            <div class="form-group">
-                                <label class="form-label">1. เลือกสินค้าสำเร็จรูป (FG) ที่ชำรุด <span style="color:red;">*</span></label>
-                                <select name="product_id" id="productSelect" class="form-control select2-search" required>
-                                    <option value="">-- พิมพ์ค้นหาสินค้า --</option>
-                                    <?php 
-                                    $res = mysqli_query($conn, "SELECT id, p_name, p_qty, p_unit FROM products WHERE p_type = 'PRODUCT' ORDER BY p_name ASC");
-                                    if ($res && mysqli_num_rows($res) > 0) {
-                                        while($row = mysqli_fetch_assoc($res)) { 
-                                            $unit = $row['p_unit'] ?: 'หน่วย';
-                                            echo "<option value='{$row['id']}'>📦 {$row['p_name']} (รวมทุก Lot: {$row['p_qty']} $unit)</option>"; 
-                                        }
-                                    }
-                                    ?>
-                                </select>
-                            </div>
-                            <div class="form-group" style="background:#f8f9fc; padding:15px; border-radius:10px; border:1px solid #d1d3e2;">
-                                <label class="form-label" style="color:#4e73df;">2. ระบุเลข LOT ที่ต้องการตัดทิ้ง <span style="color:red;">*</span></label>
-                                <select name="lot_no" id="lotSelect" class="form-control" required disabled>
-                                    <option value="">-- กรุณาเลือกสินค้าด้านบนก่อน --</option>
-                                </select>
-                                <small id="lotInfo" style="color:#e74a3b; display:block; margin-top:8px;"></small>
-                            </div>
-                        </div>
-
-                        <div>
-                            <div class="form-group">
-                                <label class="form-label">3. จำนวนที่เสียหาย (ตัวเลขเท่านั้น) <span style="color:red;">*</span></label>
-                                <input type="number" step="0.01" name="qty" class="form-control" placeholder="ระบุจำนวนที่เสียหาย..." required>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">4. สาเหตุที่ชำรุด (สำคัญต่อบัญชี) <span style="color:red;">*</span></label>
-                                <textarea name="reason" class="form-control" rows="3" placeholder="เช่น ถุงฉีกขาด, ขึ้นรา, หมดอายุคาคลัง..." required></textarea>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div style="clear:both; overflow:hidden; margin-top: 10px;">
-                        <button type="submit" name="save_scrap" class="btn-save" onclick="return confirm('ยืนยันการตัดชำรุด? ยอดจะถูกหักออกจากคลังถาวร');">
-                            <i class="fa-solid fa-trash-can"></i> ยืนยันการตัดชำรุด
-                        </button>
-                    </div>
-                </form>
+            <div class="form-group" style="background:#f8fafc; padding:20px; border-radius:12px; border:1px dashed #cbd5e1;">
+                <label class="form-label">1. เลือกสินค้า และคลัง/ไซโล ที่ต้องการหักยอด <span style="color:red;">*</span></label>
+                <select name="source_stock" id="source_stock" class="form-control select2" required onchange="updateMaxQty()">
+                    <option value="">-- พิมพ์ค้นหาสินค้า หรือ โกดัง --</option>
+                    <?php while($src = mysqli_fetch_assoc($res_source)): ?>
+                        <option value="<?= $src['product_id'] ?>|<?= $src['wh_id'] ?>" data-max="<?= $src['qty'] ?>" data-unit="<?= $src['p_unit'] ?>">
+                            <?= htmlspecialchars($src['p_name']) ?> — [<?= $src['plant'] ?>] <?= $src['wh_name'] ?> (มี: <?= number_format($src['qty'],2) ?>)
+                        </option>
+                    <?php endwhile; ?>
+                </select>
             </div>
 
-            <div class="history-card">
-                <h3 style="margin-top:0; color:#4e73df; font-size: 18px; border-bottom: 1px solid #f0f0f0; padding-bottom: 15px;"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติรายการของเสีย (Scrap History)</h3>
-                
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th style="width: 15%;">วันที่บันทึก</th>
-                                <th style="width: 30%;">สินค้า / เลข LOT</th>
-                                <th style="width: 15%;">จำนวนที่เสีย</th>
-                                <th style="width: 25%;">สาเหตุ (Reason)</th>
-                                <th style="width: 15%;">ผู้ทำรายการ</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php
-                            $q_scrap = mysqli_query($conn, "SELECT s.*, p.p_name, p.p_unit 
-                                                            FROM scrap_records s 
-                                                            JOIN products p ON s.product_id = p.id 
-                                                            ORDER BY s.id DESC LIMIT 50");
-                            if ($q_scrap && mysqli_num_rows($q_scrap) > 0) {
-                                while($s = mysqli_fetch_assoc($q_scrap)) {
-                                    $is_rma = (strpos($s['lot_no'], 'RMA-') === 0);
-                                    $lot_color = $is_rma ? '#e74a3b' : '#4e73df';
-                                    $unit = $s['p_unit'] ?: 'หน่วย';
-                            ?>
-                            <tr>
-                                <td style="white-space: nowrap; color: #555;"><?= date('d/m/Y H:i', strtotime($s['created_at'])) ?></td>
-                                <td>
-                                    <strong style="color: #2c3e50; font-size: 15px;"><?= htmlspecialchars($s['p_name']) ?></strong><br>
-                                    <span style="background: #f8f9fc; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; color: <?= $lot_color ?>; border: 1px solid <?= $lot_color ?>; display: inline-block; margin-top: 5px;">
-                                        <?= htmlspecialchars($s['lot_no']) ?>
-                                    </span>
-                                </td>
-                                <td><strong style="color:#e74a3b; font-size: 16px;"><?= number_format($s['qty'], 2) ?></strong> <small><?= $unit ?></small></td>
-                                <td style="line-height: 1.5; color: #444;"><?= htmlspecialchars($s['reason']) ?></td>
-                                <td><span style="background: #eaecf4; color: #5a5c69; padding: 4px 10px; border-radius: 50px; font-size: 12px;"><i class="fa-solid fa-user"></i> <?= htmlspecialchars($s['reported_by']) ?></span></td>
-                            </tr>
-                            <?php } } else { echo "<tr><td colspan='5' style='text-align:center; padding:40px; color:#888;'><i class='fa-solid fa-box-open fa-2x' style='color:#ccc; margin-bottom:15px;'></i><br>ยังไม่มีประวัติของเสียในระบบ</td></tr>"; } ?>
-                        </tbody>
-                    </table>
+            <div style="display:flex; gap:20px; flex-wrap:wrap;">
+                <div class="form-group" style="flex:1; min-width:200px;">
+                    <label class="form-label">2. จำนวนที่ตัดทิ้ง <span style="color:red;">*</span></label>
+                    <div style="position:relative;">
+                        <input type="number" step="0.001" name="qty" id="qty" class="form-control" style="font-weight:bold; color:var(--primary);" required>
+                        <span id="unit_display" style="position:absolute; right:15px; top:15px; color:#94a3b8; font-weight:bold;">-</span>
+                    </div>
+                </div>
+                <div class="form-group" style="flex:1; min-width:200px;">
+                    <label class="form-label">3. Lot No. <small style="color:#94a3b8;">(ถ้ามี)</small></label>
+                    <input type="text" name="lot_no" class="form-control" placeholder="เช่น LOT-2026...">
                 </div>
             </div>
 
+            <div class="form-group">
+                <label class="form-label">4. สาเหตุที่ชำรุด / ของเสีย <span style="color:red;">*</span></label>
+                <select name="reason" class="form-control" required style="font-weight:bold;">
+                    <option value="">-- เลือกเหตุผล --</option>
+                    <option value="มอด/แมลงลง">🐛 มอด / แมลงลง</option>
+                    <option value="ความชื้น/เชื้อรา">💧 ความชื้น / เชื้อราขึ้น</option>
+                    <option value="หนูกัดกระสอบฉีกขาด">🐁 หนูกัด / กระสอบฉีกขาด</option>
+                    <option value="สินค้าหมดอายุ">⏳ สินค้าหมดอายุ</option>
+                    <option value="เสียหายระหว่างผลิต/ขนส่ง">🚚 เสียหายระหว่างการผลิต / ขนส่ง</option>
+                    <option value="อื่นๆ">📝 อื่นๆ (โปรดระบุในหมายเหตุ)</option>
+                </select>
+            </div>
+
+            <button type="submit" name="submit_scrap" class="btn-submit">
+                <i class="fa-solid fa-trash-can"></i> ยืนยันตัดสต็อกของเสีย
+            </button>
+        </form>
+    </div>
+
+    <div class="history-card">
+        <h3 style="margin-top:0; color:#475569; border-bottom: 2px solid #e2e8f0; padding-bottom: 15px; font-size:20px;">
+            <i class="fa-solid fa-clock-rotate-left"></i> ประวัติการตัดชำรุด (ล่าสุด)
+        </h3>
+        <div style="overflow-x:auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th width="15%">วันที่/เวลา</th>
+                        <th width="35%">สินค้า / Lot</th>
+                        <th width="15%" style="text-align:right;">ปริมาณ</th>
+                        <th width="35%">สาเหตุ</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if(mysqli_num_rows($res_history) > 0): ?>
+                        <?php while($row = mysqli_fetch_assoc($res_history)): ?>
+                            <tr>
+                                <td>
+                                    <span style="color:#64748b; font-weight:bold; font-size:14px;"><?= date('d/m/Y', strtotime($row['created_at'])) ?></span><br>
+                                    <small style="color:#94a3b8;"><?= date('H:i', strtotime($row['created_at'])) ?></small>
+                                </td>
+                                <td>
+                                    <strong style="color:var(--text-main); font-size:16px;"><?= htmlspecialchars($row['p_name']) ?></strong><br>
+                                    <span style="background:#f1f5f9; padding:2px 8px; border-radius:4px; font-size:12px; color:#64748b; font-weight:bold;"><?= $row['lot_no'] ?></span>
+                                </td>
+                                <td align="right">
+                                    <strong style="color:var(--primary); font-size:18px;">-<?= number_format($row['qty'],2) ?></strong> <small style="color:#94a3b8; font-weight:bold;"><?= $row['p_unit'] ?></small>
+                                </td>
+                                <td>
+                                    <span style="color:#475569; font-weight:bold;"><i class="fa-solid fa-caret-right" style="color:#cbd5e1; margin-right:5px;"></i><?= htmlspecialchars($row['reason']) ?></span>
+                                </td>
+                            </tr>
+                        <?php endwhile; ?>
+                    <?php else: ?>
+                        <tr><td colspan="4" style="text-align:center; padding:40px; color:#94a3b8; font-size:16px;">ยังไม่มีประวัติการตัดชำรุด</td></tr>
+                    <?php endif; ?>
+                </tbody>
+            </table>
         </div>
     </div>
 </div>
 
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-
 <script>
-    $(document).ready(function() {
-        $('.select2-search').select2({ width: '100%' });
+    $(document).ready(function() { $('.select2').select2({ width: '100%' }); });
 
-        $('#productSelect').on('change', function() {
-            let pid = $(this).val();
-            let lotSelect = $('#lotSelect');
-            let lotInfo = $('#lotInfo');
+    function updateMaxQty() {
+        let opt = $('#source_stock').find(':selected');
+        let max = opt.data('max');
+        let unit = opt.data('unit');
+        
+        if (opt.val() !== '') {
+            $('#qty').attr('max', max);
+            $('#qty').attr('placeholder', 'ระบุจำนวน (ไม่เกิน ' + max + ')');
+            $('#unit_display').text(unit);
+        } else {
+            $('#qty').attr('placeholder', '');
+            $('#unit_display').text('-');
+        }
+    }
 
-            if (!pid) {
-                lotSelect.html('<option value="">-- กรุณาเลือกสินค้าด้านบนก่อน --</option>').prop('disabled', true);
-                lotInfo.text('');
-                return;
-            }
-
-            lotSelect.html('<option value="">กำลังโหลดรายการ LOT...</option>').prop('disabled', true);
-            lotInfo.text('');
-
-            $.ajax({
-                url: 'scrap_product.php',
-                type: 'POST',
-                data: { action: 'get_lots', product_id: pid },
-                dataType: 'json',
-                success: function(data) {
-                    if (data.length > 0) {
-                        let options = '<option value="">-- เลือก LOT ที่ชำรุด --</option>';
-                        $.each(data, function(index, lot) {
-                            options += `<option value="${lot.lot_no}">${lot.lot_no} (มี: ${lot.qty} | หมดอายุ: ${lot.exp_date_th})</option>`;
-                        });
-                        lotSelect.html(options).prop('disabled', false);
-                    } else {
-                        lotSelect.html('<option value="">-- ไม่มีสต็อกหลงเหลือใน LOT ใดๆ เลย --</option>');
-                        lotInfo.html('<i class="fa-solid fa-circle-xmark"></i> สินค้านี้สต็อกเกลี้ยงคลัง หรือยังไม่ผ่าน QA ครับ');
-                    }
-                },
-                error: function() {
-                    lotSelect.html('<option value="">-- เกิดข้อผิดพลาดในการโหลดข้อมูล --</option>');
-                }
-            });
-        });
-    });
-
-    <?php if($status == 'success'): ?>
-    Swal.fire({ icon: 'success', title: 'บันทึกตัดชำรุดสำเร็จ', text: 'ระบบลบยอดจาก LOT และเก็บประวัติให้ฝ่ายบัญชีตรวจสอบแล้ว', confirmButtonColor: '#e74a3b' }).then(()=> { window.location.href='scrap_product.php'; });
-    <?php elseif($status == 'error'): ?>
-    Swal.fire({ icon: 'error', title: 'ข้อผิดพลาด', text: '<?php echo $error_msg; ?>', confirmButtonColor: '#e74a3b' });
-    <?php endif; ?>
+    const urlParams = new URLSearchParams(window.location.search);
+    if(urlParams.get('status') === 'success') {
+        Swal.fire({ icon: 'success', title: 'บันทึกสำเร็จ!', text: 'ระบบตัดสต็อกของเสียเรียบร้อยแล้ว', timer: 2000, showConfirmButton: false })
+        .then(() => { window.history.replaceState(null, null, window.location.pathname); });
+    }
 </script>
-</body>
-</html>

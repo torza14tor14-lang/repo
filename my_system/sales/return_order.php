@@ -46,6 +46,7 @@ if (isset($_GET['get_sale_items'])) {
 // 🚀 จัดการเมื่อกดปุ่ม "ยืนยันการรับคืนสินค้า"
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['submit_return'])) {
     $sale_id = (int)$_POST['sale_id'];
+    $wh_id = (int)$_POST['wh_id']; // 🚀 คลังที่เซลส์เลือกโยนของเข้า
     $reason = mysqli_real_escape_string($conn, $_POST['reason']);
     $total_refund = 0;
     
@@ -68,31 +69,32 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['submit_return'])) {
 
                     // 1. นำสินค้ากลับเข้าคลัง โดยตั้งสถานะเป็น Pending_QA (รอกักกันให้ QA ตรวจสอบว่าเสียจริงไหม)
                     $lot_no = "RMA-" . date('Ymd') . "-S" . $sale_id . "-" . $p_id;
-                    $exp = date('Y-m-d', strtotime('+30 days')); // หมดอายุจำลองไปก่อน QA จะเป็นคนเคาะ
+                    $exp = date('Y-m-d', strtotime('+30 days')); 
                     mysqli_query($conn, "INSERT INTO inventory_lots (product_id, lot_no, mfg_date, exp_date, qty, status) 
                                          VALUES ($p_id, '$lot_no', CURDATE(), '$exp', $ret_qty, 'Pending_QA')");
                     
-                    // บันทึก Log การคืนของ
-                    mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, reference, action_by) 
-                                         VALUES ($p_id, 'IN', $ret_qty, 'ลูกค้ารับคืน (RMA จากบิล INV-$sale_id)', '$fullname')");
+                    // 2. 🚀 เพิ่มยอดเข้าคลัง (Multi-Warehouse) ที่เลือกลงกักกัน
+                    mysqli_query($conn, "INSERT INTO stock_balances (product_id, wh_id, qty) 
+                                         VALUES ($p_id, $wh_id, $ret_qty) 
+                                         ON DUPLICATE KEY UPDATE qty = qty + $ret_qty");
+
+                    // 3. บันทึก Log การคืนของ
+                    mysqli_query($conn, "INSERT INTO stock_log (product_id, type, qty, to_wh_id, reference, action_by) 
+                                         VALUES ($p_id, 'IN', $ret_qty, $wh_id, 'ลูกค้ารับคืน (RMA จากบิล INV-$sale_id)', '$fullname')");
                 }
             }
         }
 
         if ($total_refund > 0) {
-            // 2. บันทึกเอกสารใบลดหนี้ (Credit Note / RMA)
             mysqli_query($conn, "INSERT INTO sales_returns (sale_id, cus_id, return_date, total_refund, reason, created_by) 
                                  VALUES ($sale_id, $cus_id, CURDATE(), $total_refund, '$reason', '$fullname')");
             
-            // 3. ปรับปรุงลดยอดหนี้ในบิลขายหลัก (บัญชีจะได้ไม่ต้องตามเก็บเงินส่วนนี้)
             mysqli_query($conn, "UPDATE sales_orders SET total_amount = total_amount - $total_refund WHERE sale_id = $sale_id");
 
-            // 4. บันทึก Log เข้าระบบ
             if(function_exists('log_event')) {
                 log_event($conn, 'INSERT', 'sales_returns', "รับคืนสินค้า/ลดหนี้ บิล INV-$sale_id ลูกค้า: $cus_name ยอดคืน " . number_format($total_refund, 2) . " ฿ | เหตุผล: $reason");
             }
 
-            // 5. แจ้งเตือน LINE (ส่งให้ คลัง, บัญชี, QA รับทราบพร้อมกัน)
             include_once '../line_api.php';
             $msg = "🔄 [ฝ่ายขาย] แจ้งรับคืนสินค้าจากลูกค้า (RMA)\n\n";
             $msg .= "🧾 อ้างอิงบิลเดิม: INV-" . str_pad($sale_id, 5, '0', STR_PAD_LEFT) . "\n";
@@ -109,6 +111,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['submit_return'])) {
         }
     }
 }
+
+// เตรียมรายชื่อคลังไว้สำหรับเลือกโยนกักกัน
+$res_wh = mysqli_query($conn, "SELECT * FROM warehouses ORDER BY plant ASC, wh_name ASC");
 
 include '../sidebar.php';
 ?>
@@ -145,7 +150,6 @@ include '../sidebar.php';
                 <select name="sale_id" id="sale_select" class="form-control select2" required onchange="loadSaleItems()">
                     <option value="">-- พิมพ์ค้นหาเลขบิล หรือ ชื่อลูกค้า --</option>
                     <?php 
-                    // แสดงบิลที่ขายไปแล้ว (เรียงจากใหม่ไปเก่า)
                     $q_sales = mysqli_query($conn, "SELECT sale_id, customer_name, sale_date, total_amount FROM sales_orders ORDER BY sale_id DESC LIMIT 100");
                     while($s = mysqli_fetch_assoc($q_sales)) {
                         $inv = "INV-" . str_pad($s['sale_id'], 5, '0', STR_PAD_LEFT);
@@ -167,14 +171,32 @@ include '../sidebar.php';
                                 <th style="width: 25%;">ระบุจำนวนที่ส่งคืน (หน่วย)</th>
                             </tr>
                         </thead>
-                        <tbody id="items_body">
-                            </tbody>
+                        <tbody id="items_body"></tbody>
                     </table>
                 </div>
 
-                <div style="margin-top: 20px;">
-                    <label style="font-weight:bold; color:#555; display:block; margin-bottom:8px;">3. สาเหตุการคืนของ <span style="color:red;">*</span></label>
-                    <textarea name="reason" class="form-control" rows="2" placeholder="เช่น สินค้าชื้น, ถุงฉีกขาดระหว่างขนส่ง, ส่งผิดสูตร..." required></textarea>
+                <div style="display:flex; gap:20px; margin-top:20px; flex-wrap:wrap;">
+                    <div style="flex:1; min-width:300px;">
+                        <label style="font-weight:bold; color:#555; display:block; margin-bottom:8px;">3. เลือกคลังกักกันสำหรับเก็บของคืน <span style="color:red;">*</span></label>
+                        <select name="wh_id" class="form-control select2" required style="border-color:#e74a3b;">
+                            <option value="">-- เลือกคลัง/โกดัง --</option>
+                            <?php 
+                            if ($res_wh) {
+                                mysqli_data_seek($res_wh, 0);
+                                while($wh = mysqli_fetch_assoc($res_wh)) {
+                                    $sel = ($wh['wh_type'] == 'Hold' || $wh['wh_type'] == 'Scrap') ? 'selected' : '';
+                                    echo "<option value='{$wh['wh_id']}' $sel>[{$wh['plant']}] {$wh['wh_name']}</option>";
+                                }
+                            }
+                            ?>
+                        </select>
+                        <small style="color:#e74a3b; font-weight:bold; margin-top:5px; display:block;"><i class="fa-solid fa-triangle-exclamation"></i> สินค้าจะถูกกักกัน (Hold) ทันทีจนกว่า QA จะตรวจสอบ</small>
+                    </div>
+
+                    <div style="flex:1; min-width:300px;">
+                        <label style="font-weight:bold; color:#555; display:block; margin-bottom:8px;">4. สาเหตุการคืนของ <span style="color:red;">*</span></label>
+                        <textarea name="reason" class="form-control" rows="2" placeholder="เช่น สินค้าชื้น, ถุงฉีกขาดระหว่างขนส่ง, ส่งผิดสูตร..." required></textarea>
+                    </div>
                 </div>
 
                 <button type="submit" name="submit_return" class="btn-submit"><i class="fa-solid fa-file-shield"></i> ออกใบลดหนี้ และคืนของเข้าคลัง</button>
@@ -213,7 +235,6 @@ include '../sidebar.php';
             </table>
         </div>
     </div>
-
 </div>
 
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>

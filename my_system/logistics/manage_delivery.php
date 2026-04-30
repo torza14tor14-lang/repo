@@ -140,7 +140,7 @@ include '../sidebar.php';
 
 <style>
     :root { 
-        --primary: #0ea5e9; --primary-hover: #0284c7; --primary-light: #e0f2fe;
+        --primary-light: #e0f2fe;
         --success: #10b981; --warning: #f59e0b; --danger: #ef4444;
         --bg-color: #f8fafc; --card-bg: #ffffff; --border-color: #e2e8f0;
         --text-main: #1e293b; --text-muted: #64748b;

@@ -11,7 +11,7 @@ $user_role = $_SESSION['role'] ?? '';
 $user_dept = $_SESSION['dept'] ?? '';
 $fullname = $_SESSION['fullname'] ?? $_SESSION['username'] ?? 'User';
 
-if ($user_role !== 'ADMIN' && $user_dept !== 'แผนกผลิต 1' && $user_dept !== 'แผนกผลิต 2') { 
+if ($user_role !== 'ADMIN' && $user_dept !== 'แผนกผลิต 1' && $user_dept !== 'แผนกผลิต 2' && $user_dept !== 'ฝ่ายงานวางแผน') { 
     echo "<script>alert('ไม่มีสิทธิ์เข้าถึง'); window.location='../index.php';</script>"; exit(); 
 }
 
